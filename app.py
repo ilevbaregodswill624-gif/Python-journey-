@@ -1,8 +1,11 @@
+import os
 import random
 from flask import Flask, request, render_template_string, session
 
 app = Flask(__name__)
-app.secret_key = "change-this-later"
+app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me")
+
+MAX_TRIES = 5
 
 PAGE = """
 <!DOCTYPE html>
@@ -33,13 +36,13 @@ PAGE = """
       font-size: 24px; text-align: center;
       border: none; border-radius: 12px; outline: none;
     }
-    button {
-      width: 100%; padding: 14px;
-      font-size: 18px; font-weight: bold;
+    button, .btn {
+      display: block; width: 100%; padding: 14px;
+      font-size: 18px; font-weight: bold; text-decoration: none;
       background: #facc15; color: #1e1b4b;
       border: none; border-radius: 12px; cursor: pointer;
     }
-    button:hover { transform: scale(1.03); }
+    button:hover, .btn:hover { transform: scale(1.03); }
     .msg { min-height: 28px; margin: 20px 0 12px; font-size: 20px; font-weight: bold; }
     .low { color: #93c5fd; }
     .high { color: #fca5a5; }
@@ -50,20 +53,29 @@ PAGE = """
       border-radius: 50%; background: rgba(255,255,255,0.25);
     }
     .dots span.used { background: #facc15; }
+    .best { margin-top: 18px; opacity: 0.9; }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>🎯 Guessing Game</h1>
     <p class="sub">I'm thinking of a number between 1 and 20.</p>
-    <form method="post">
-      <input type="number" name="guess" min="1" max="20" placeholder="?" required autofocus>
-      <button type="submit">Guess</button>
-    </form>
+
+    {% if over %}
+      <a class="btn" href="/">Play again 🔁</a>
+    {% else %}
+      <form method="post">
+        <input type="number" name="guess" min="1" max="20" placeholder="?" required autofocus>
+        <button type="submit">Guess</button>
+      </form>
+    {% endif %}
+
     <div class="msg {{ kind }}">{{ message }}</div>
     <div class="dots">
       {% for i in range(5) %}<span class="{{ 'used' if i < attempts else '' }}"></span>{% endfor %}
     </div>
+
+    {% if best %}<div class="best">🏆 Best: {{ best }} attempts</div>{% endif %}
   </div>
 </body>
 </html>
@@ -75,30 +87,38 @@ def home():
         session["secret"] = random.randint(1, 20)
         session["attempts"] = 0
 
-    message = ""
-    kind = ""
+    message, kind, over = "", "", False
 
     if request.method == "POST":
         guess = int(request.form["guess"])
         session["attempts"] += 1
+        tries = session["attempts"]
+        secret = session["secret"]
 
-        if guess < session["secret"]:
-            message = "Too low 📉"
-            kind = "low"
-        elif guess > session["secret"]:
-            message = "Too high 📈"
-            kind = "high"
+        if guess == secret:
+            message = f"You got it in {tries} attempts! 🎉"
+            kind, over = "win", True
+            best = session.get("best")
+            if best is None or tries < best:
+                session["best"] = tries
+                message += " New best!"
+        elif tries >= MAX_TRIES:
+            message = f"Out of attempts. It was {secret} 💀"
+            kind, over = "lose", True
+        elif guess < secret:
+            message, kind = "Too low 📉", "low"
         else:
-            message = f"You got it in {session['attempts']} attempts! 🎉"
-            session.clear()
-            return render_template_string(PAGE, message=message, kind="win", attempts=0)
+            message, kind = "Too high 📈", "high"
 
-        if session["attempts"] >= 5:
-            message = f"Out of attempts. It was {session['secret']} 💀"
-            session.clear()
-            return render_template_string(PAGE, message=message, kind="lose", attempts=0)
+    attempts = session["attempts"]
+    if over:
+        session.pop("secret")
+        session.pop("attempts")
 
-    return render_template_string(PAGE, message=message, kind=kind, attempts=session["attempts"])
+    return render_template_string(
+        PAGE, message=message, kind=kind, over=over,
+        attempts=attempts, best=session.get("best"),
+    )
 
 if __name__ == "__main__":
     app.run(debug=True)
