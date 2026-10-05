@@ -11,7 +11,7 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me")
 db_url = os.environ.get("DATABASE_URL", "sqlite:///game.db")
 if db_url.startswith("postgres://"):
    db_url = db_url.replace("postgres://","postresql+psycopg://", 1)
-elif db_url.startwith("postgresql://"):
+elif db_url.startswith("postgresql://"):
     db_url = db_url.replace("postgresq1://", "postgresql+psycopg://", 1)
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 db = SQLAlchemy(app)
