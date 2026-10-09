@@ -46,6 +46,12 @@ class Counter(db.Model):
     value = db.Column(db.Integer, default=0, nullable=False)
 
 
+class PlayerXP(db.Model):
+    # Separate table so existing Player records do not need a schema migration.
+    name = db.Column(db.String(20), primary_key=True)
+    xp = db.Column(db.Integer, default=0, nullable=False)
+
+
 class Game(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(20), nullable=False, index=True)
@@ -134,6 +140,7 @@ GAME = """
   <div class="links"><a href="/leaderboard">Leaderboard</a></div>
 {% else %}
   <p class="sub">Playing as <b>{{ player }}</b> · <a href="/name">log out</a></p>
+  <p class="sub">⭐ Total XP: <b>{{ total_xp }}</b></p>
   <p class="sub">I'm thinking of a number between 1 and {{ hi }}.</p>
   <div class="levels">
     {% for name in levels %}
@@ -174,15 +181,18 @@ BOARD = """
 </div>
 {% if rows %}
 <table>
-  <tr><th>#</th><th>Name</th><th>Best</th></tr>
+  <tr><th>#</th><th>Name</th><th>XP</th><th>Best</th></tr>
   {% for r in rows %}
     <tr class="{{ 'me' if r.name == player else '' }}">
-      <td>{{ loop.index }}</td><td>{{ r.name }}</td><td>{{ r.best }}</td>
+      <td>{{ loop.index }}</td>
+      <td>{{ r.name }}</td>
+      <td>⭐ {{ r.xp }}</td>
+      <td>{{ r.best if r.best is not none else '-' }}</td>
     </tr>
   {% endfor %}
 </table>
 {% else %}
-<p class="sub">No scores yet. Be the first 👀</p>
+<p class="sub">No players yet. Be the first 👀</p>
 {% endif %}
 <a class="btn" href="/">Back to game</a>
 {% endblock %}
@@ -317,20 +327,50 @@ def home():
                 db.session.add(Score(name=player, level=level, attempts=tries))
                 db.session.add(Game(name=player, level=level, won=True,
                                     attempts=tries, secret=secret))
+                xp_reward = max(5, 35 - (tries * 5))
+                xp_row = db.session.get(PlayerXP, player)
+                if xp_row is None:
+                    xp_row = PlayerXP(name=player, xp=0)
+                    db.session.add(xp_row)
+                xp_row.xp += xp_reward
                 db.session.commit()
+                message += f" ⭐ +{xp_reward} XP!"
                 bump("games_played")
                 bump("wins")
+
             elif tries >= max_tries:
                 message = f"Out of attempts. It was {secret} 💀"
                 kind, over = "lose", True
                 db.session.add(Game(name=player, level=level, won=False,
                                     attempts=tries, secret=secret))
+                xp_row = db.session.get(PlayerXP, player)
+                if xp_row is None:
+                    xp_row = PlayerXP(name=player, xp=0)
+                    db.session.add(xp_row)
+                xp_row.xp += 5
                 db.session.commit()
+                message += " ⭐ +5 XP for playing!"
                 bump("games_played")
+
             elif guess < secret:
-                message, kind = "Too low 📉", "low"
+                distance = secret - guess
+
+                if distance <= 3:
+                    message, kind = "Too low! 🔥 You're very hot!", "low"
+                elif distance <= 7:
+                    message, kind = "Too low! 🌡️ You're getting warm!", "low"
+                else:
+                    message, kind = "Too low 📉", "low"
+
             else:
-                message, kind = "Too high 📈", "high"
+                distance = guess - secret
+
+                if distance <= 3:
+                    message, kind = "Too high! 🔥 You're very hot!", "high"
+                elif distance <= 7:
+                    message, kind = "Too high! 🌡️ You're getting warm!", "high"
+                else:
+                    message, kind = "Too high 📈", "high"
 
     attempts = session["attempts"]
     if over:
@@ -338,14 +378,17 @@ def home():
         session.pop("attempts")
 
     best = None
+    total_xp = 0
     if player:
         best = (db.session.query(func.min(Score.attempts))
                 .filter_by(name=player, level=level).scalar())
+        xp_row = db.session.get(PlayerXP, player)
+        total_xp = xp_row.xp if xp_row else 0
 
     return render_template(
         "game.html", message=message, kind=kind, over=over, attempts=attempts,
         level=level, levels=list(LEVELS), hi=hi, max_tries=max_tries,
-        player=player, best=best,
+        player=player, best=best, total_xp=total_xp,
     )
 
 
@@ -354,11 +397,29 @@ def leaderboard():
     level = request.args.get("level") or session.get("level", "medium")
     if level not in LEVELS:
         level = "medium"
-    rows = (db.session.query(Score.name, func.min(Score.attempts).label("best"))
-            .filter_by(level=level)
-            .group_by(Score.name)
-            .order_by(func.min(Score.attempts), Score.name)
+    # Rank the top 10 players by total XP, then use their best score as a tie-breaker.
+    xp_subquery = (db.session.query(
+                       PlayerXP.name.label("name"),
+                       PlayerXP.xp.label("xp"))
+                   .subquery())
+
+    best_subquery = (db.session.query(
+                         Score.name.label("name"),
+                         func.min(Score.attempts).label("best"))
+                     .filter_by(level=level)
+                     .group_by(Score.name)
+                     .subquery())
+
+    rows = (db.session.query(
+                xp_subquery.c.name,
+                xp_subquery.c.xp,
+                best_subquery.c.best)
+            .outerjoin(best_subquery, best_subquery.c.name == xp_subquery.c.name)
+            .order_by(xp_subquery.c.xp.desc(),
+                      best_subquery.c.best.asc(),
+                      xp_subquery.c.name.asc())
             .limit(10).all())
+
     return render_template("board.html", rows=rows, level=level,
                            levels=list(LEVELS), player=session.get("player"))
 
