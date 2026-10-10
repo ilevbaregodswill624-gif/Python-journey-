@@ -85,10 +85,11 @@ BASE = """
   {{ analytics|safe }}
   <style>
     * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; display: flex; align-items: center;
+    body { margin: 0; min-height: 100vh; display: flex; align-items: flex-start;
       justify-content: center; font-family: "Segoe UI", Arial, sans-serif; color: white;
-      background: linear-gradient(135deg, #1e1b4b, #4c1d95, #be185d); }
-    .card { width: 90%; max-width: 380px; padding: 32px; text-align: center; margin: 20px 0;
+      background: linear-gradient(135deg, #1e1b4b, #4c1d95, #be185d);
+      overflow-y: auto; padding: 20px 0; box-sizing: border-box; }
+    .card { width: 95%; max-width: 500px; padding: 32px; text-align: center; margin: 20px 0;
       background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);
       border-radius: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.3); }
     h1 { margin: 0 0 8px; }
@@ -418,7 +419,7 @@ def leaderboard():
             .order_by(xp_subquery.c.xp.desc(),
                       best_subquery.c.best.asc(),
                       xp_subquery.c.name.asc())
-            .limit(10).all())
+            .all())
 
     return render_template("board.html", rows=rows, level=level,
                            levels=list(LEVELS), player=session.get("player"))
