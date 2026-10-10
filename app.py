@@ -1,7 +1,7 @@
 import os
 import re
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from flask import Flask, request, render_template, session, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
 from jinja2 import DictLoader
@@ -52,6 +52,26 @@ class PlayerXP(db.Model):
     xp = db.Column(db.Integer, default=0, nullable=False)
 
 
+class DailyReward(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(20), nullable=False, index=True)
+    reward_date = db.Column(db.String(10), nullable=False)
+    __table_args__ = (db.UniqueConstraint("name", "reward_date", name="uq_daily_reward"),)
+
+
+class Challenge(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    creator = db.Column(db.String(20), nullable=False, index=True)
+    opponent = db.Column(db.String(20), nullable=False, index=True)
+    level = db.Column(db.String(10), nullable=False)
+    creator_attempts = db.Column(db.Integer)
+    opponent_attempts = db.Column(db.Integer)
+    creator_won = db.Column(db.Boolean)
+    opponent_won = db.Column(db.Boolean)
+    status = db.Column(db.String(20), default="pending", nullable=False)
+    created = db.Column(db.DateTime, server_default=func.now())
+
+
 class Game(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(20), nullable=False, index=True)
@@ -81,7 +101,7 @@ BASE = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Guessing Game</title>
+  <title>Guessing Game Plus</title>
   {{ analytics|safe }}
   <style>
     * { box-sizing: border-box; }
@@ -116,10 +136,24 @@ BASE = """
     table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
     td, th { padding: 8px 4px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.15); }
     tr.me td { color: #facc15; font-weight: bold; }
+    .nav { display:flex; flex-wrap:wrap; justify-content:center; gap:12px; margin:14px 0; }
+    .nav a { color:#facc15; }
+    .profile-box { padding:12px; margin:12px 0; border-radius:12px; background:rgba(0,0,0,.15); }
+    body.theme-ocean { background:linear-gradient(135deg,#082f49,#0369a1,#0f766e); }
+    body.theme-sunset { background:linear-gradient(135deg,#7c2d12,#c2410c,#9d174d); }
+    body.theme-dark { background:linear-gradient(135deg,#09090b,#27272a,#18181b); }
+    .muted { opacity:.8; font-size:14px; }
   </style>
 </head>
-<body>
+<body class="theme-{{ theme|default('purple') }}">
   <div class="card">{% block content %}{% endblock %}</div>
+<script>
+  // Tiny optional browser beep when a win/loss message is displayed.
+  const msg = document.querySelector('.msg');
+  if (msg && (msg.classList.contains('win') || msg.classList.contains('lose'))) {
+    try { const ctx = new (window.AudioContext || window.webkitAudioContext)(); const osc = ctx.createOscillator(); const gain = ctx.createGain(); osc.connect(gain); gain.connect(ctx.destination); osc.frequency.value = msg.classList.contains('win') ? 880 : 220; gain.gain.value = 0.035; osc.start(); osc.stop(ctx.currentTime + 0.12); } catch(e) {}
+  }
+</script>
 </body>
 </html>
 """
@@ -139,9 +173,14 @@ GAME = """
   </form>
   <div class="msg {{ kind }}">{{ message }}</div>
   <div class="links"><a href="/leaderboard">Leaderboard</a></div>
+  <p class="muted">Create an account to save XP, badges and progress.</p>
 {% else %}
   <p class="sub">Playing as <b>{{ player }}</b> · <a href="/name">log out</a></p>
-  <p class="sub">⭐ Total XP: <b>{{ total_xp }}</b></p>
+  <p class="sub">⭐ Total XP: <b>{{ total_xp }}</b> · Level <b>{{ player_level }}</b></p>
+  <p class="sub">🎁 Daily reward: {{ daily_status }}</p>
+  <div class="nav"><a href="/profile">Profile</a><a href="/challenges">Challenges</a><a href="/progress">Progress</a><a href="/settings">Theme</a></div>
+  <p class="muted">🏅 Badges: {{ badges|join(', ') if badges else 'Play games to earn badges' }}</p>
+  <p class="muted">🎯 Daily challenge: win a game today for bonus XP.</p>
   <p class="sub">I'm thinking of a number between 1 and {{ hi }}.</p>
   <div class="levels">
     {% for name in levels %}
@@ -236,7 +275,36 @@ app.jinja_loader = DictLoader({
 
 @app.context_processor
 def inject_analytics():
-    return {"analytics": os.environ.get("ANALYTICS_SCRIPT", "")}
+    return {"analytics": os.environ.get("ANALYTICS_SCRIPT", ""), "theme": session.get("theme", "purple")}
+
+
+def get_xp(name):
+    row = db.session.get(PlayerXP, name)
+    return row.xp if row else 0
+
+
+def get_level(xp):
+    return max(1, xp // 100 + 1)
+
+
+def get_badges(name):
+    games = Game.query.filter_by(name=name).all()
+    xp = get_xp(name)
+    badges = []
+    if games: badges.append("🎮 First Game")
+    if any(g.won for g in games): badges.append("🏆 First Win")
+    if sum(1 for g in games if g.won) >= 10: badges.append("🔥 10 Wins")
+    if xp >= 100: badges.append("⭐ 100 XP")
+    if xp >= 500: badges.append("💎 500 XP")
+    return badges
+
+
+def award_xp(name, amount):
+    row = db.session.get(PlayerXP, name)
+    if row is None:
+        row = PlayerXP(name=name, xp=0)
+        db.session.add(row)
+    row.xp += amount
 
 
 @app.route("/name", methods=["GET", "POST"])
@@ -246,6 +314,9 @@ def set_name():
         return redirect(url_for("home"))
 
     name = request.form.get("name", "").strip()[:20]
+    if name and not re.fullmatch(r"[A-Za-z0-9_ -]{1,20}", name):
+        session["login_error"] = "Use only letters, numbers, spaces, _ or -."
+        return redirect(url_for("home"))
     pin = request.form.get("pin", "").strip()
 
     if not name or not re.fullmatch(r"\d{4}", pin):
@@ -329,13 +400,12 @@ def home():
                 db.session.add(Game(name=player, level=level, won=True,
                                     attempts=tries, secret=secret))
                 xp_reward = max(5, 35 - (tries * 5))
-                xp_row = db.session.get(PlayerXP, player)
-                if xp_row is None:
-                    xp_row = PlayerXP(name=player, xp=0)
-                    db.session.add(xp_row)
-                xp_row.xp += xp_reward
+                daily_bonus = 20 if not DailyReward.query.filter_by(name=player, reward_date=date.today().isoformat()).first() else 0
+                award_xp(player, xp_reward + daily_bonus)
                 db.session.commit()
                 message += f" ⭐ +{xp_reward} XP!"
+                if daily_bonus:
+                    message += f" 🎯 +{daily_bonus} daily challenge bonus!"
                 bump("games_played")
                 bump("wins")
 
@@ -344,11 +414,7 @@ def home():
                 kind, over = "lose", True
                 db.session.add(Game(name=player, level=level, won=False,
                                     attempts=tries, secret=secret))
-                xp_row = db.session.get(PlayerXP, player)
-                if xp_row is None:
-                    xp_row = PlayerXP(name=player, xp=0)
-                    db.session.add(xp_row)
-                xp_row.xp += 5
+                award_xp(player, 5)
                 db.session.commit()
                 message += " ⭐ +5 XP for playing!"
                 bump("games_played")
@@ -386,10 +452,13 @@ def home():
         xp_row = db.session.get(PlayerXP, player)
         total_xp = xp_row.xp if xp_row else 0
 
+    daily_status = "Claimed today" if player and DailyReward.query.filter_by(name=player, reward_date=date.today().isoformat()).first() else "Available on your profile"
+    xp_value = get_xp(player) if player else 0
     return render_template(
         "game.html", message=message, kind=kind, over=over, attempts=attempts,
         level=level, levels=list(LEVELS), hi=hi, max_tries=max_tries,
         player=player, best=best, total_xp=total_xp,
+        player_level=get_level(xp_value), badges=get_badges(player) if player else [], daily_status=daily_status,
     )
 
 
@@ -398,7 +467,7 @@ def leaderboard():
     level = request.args.get("level") or session.get("level", "medium")
     if level not in LEVELS:
         level = "medium"
-    # Rank the top 10 players by total XP, then use their best score as a tie-breaker.
+    # Rank every player by total XP, then use best attempts as a tie-breaker.
     xp_subquery = (db.session.query(
                        PlayerXP.name.label("name"),
                        PlayerXP.xp.label("xp"))
@@ -442,6 +511,90 @@ def history():
     rate = round(100 * wins / played) if played else 0
     return render_template("history.html", games=games[:20], played=played,
                            wins=wins, rate=rate, streak=streak, player=player)
+
+
+@app.route("/profile")
+def profile():
+    name = session.get("player")
+    if not name: return redirect(url_for("home"))
+    games = Game.query.filter_by(name=name).all()
+    wins = sum(1 for g in games if g.won)
+    xp = get_xp(name)
+    claimed = DailyReward.query.filter_by(name=name, reward_date=date.today().isoformat()).first() is not None
+    return f"""<html><meta
+    content='width=device-width, initial-scale=1'><body style='font-family:Arial;background:#1e1b4b;color:white;padding:24px'><h1>👤 {name}'s Profile</h1><p>⭐ XP: {xp}</p><p>Level: {get_level(xp)}</p><p>Games played: {len(games)}</p><p>Wins: {wins}</p><p>Badges: {', '.join(get_badges(name)) or 'None yet'}</p><p>Daily reward: {'Already claimed today' if claimed else 'Ready to claim'}</p><p><a style='color:#facc15' href='/claim-daily'>Claim daily login reward</a></p><p><a style='color:#facc15' href='/change-pin'>Change PIN</a></p><p><a style='color:#facc15' href='/'>Back to game</a></p></body></html>"""
+
+
+@app.route("/claim-daily")
+def claim_daily():
+    name = session.get("player")
+    if not name: return redirect(url_for("home"))
+    today = date.today().isoformat()
+    if DailyReward.query.filter_by(name=name, reward_date=today).first():
+        return "Daily reward already claimed today. <a href='/profile'>Back</a>"
+    db.session.add(DailyReward(name=name, reward_date=today))
+    award_xp(name, 10)
+    db.session.commit()
+    return "🎁 You claimed 10 XP! <a href='/profile'>Back to profile</a>"
+
+
+@app.route("/change-pin", methods=["GET", "POST"])
+def change_pin():
+    name = session.get("player")
+    if not name: return redirect(url_for("home"))
+    if request.method == "POST":
+        old_pin = request.form.get("old_pin", "")
+        new_pin = request.form.get("new_pin", "")
+        player = Player.query.filter_by(name=name).first()
+        if not player or not check_password_hash(player.pin_hash, old_pin):
+            return "Current PIN is incorrect. <a href='/change-pin'>Try again</a>"
+        if not re.fullmatch(r"\d{4}", new_pin):
+            return "New PIN must be exactly 4 digits. <a href='/change-pin'>Try again</a>"
+        player.pin_hash = generate_password_hash(new_pin)
+        db.session.commit()
+        return "PIN updated successfully. <a href='/profile'>Back to profile</a>"
+    return """<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;padding:24px'><h2>Change PIN</h2><form method='post'><input name='old_pin' type='password' inputmode='numeric' placeholder='Current PIN' required><br><input name='new_pin' type='password' inputmode='numeric' pattern='[0-9]{4}' maxlength='4' placeholder='New 4-digit PIN' required><br><button>Change PIN</button></form></body></html>"""
+
+
+@app.route("/settings", methods=["GET", "POST"])
+def settings():
+    if not session.get("player"): return redirect(url_for("home"))
+    if request.method == "POST":
+        theme = request.form.get("theme", "purple")
+        if theme in {"purple", "ocean", "sunset", "dark"}: session["theme"] = theme
+        return redirect(url_for("settings"))
+    return """<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;background:#1e1b4b;color:white;padding:24px'><h2>🎨 Choose a theme</h2><form method='post'><select name='theme'><option value='purple'>Purple</option><option value='ocean'>Ocean</option><option value='sunset'>Sunset</option><option value='dark'>Dark</option></select><button>Save theme</button></form><p><a style='color:#facc15' href='/'>Back to game</a></p></body></html>"""
+
+
+@app.route("/progress")
+def progress():
+    name = session.get("player")
+    if not name: return redirect(url_for("home"))
+    games = Game.query.filter_by(name=name).order_by(Game.created.asc(), Game.id.asc()).all()
+    wins = sum(1 for g in games if g.won)
+    bars = "".join(f"<div style='margin:8px 0'>Game {i}: {'🏆 Win' if g.won else '❌ Loss'} ({g.attempts} tries)</div>" for i, g in enumerate(games[-20:], start=max(1, len(games)-19)))
+    return f"<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;background:#1e1b4b;color:white;padding:24px'><h1>📈 Progress</h1><p>Total games: {len(games)}</p><p>Wins: {wins}</p><p>Win rate: {round(wins*100/len(games)) if games else 0}%</p><h3>Last 20 games</h3>{bars or 'No games yet'}<p><a style='color:#facc15' href='/'>Back to game</a></p></body></html>"
+
+
+@app.route("/challenges", methods=["GET", "POST"])
+def challenges():
+    name = session.get("player")
+    if not name: return redirect(url_for("home"))
+    message = ""
+    if request.method == "POST":
+        opponent = request.form.get("opponent", "").strip()
+        level = request.form.get("level", "medium")
+        target = Player.query.filter(func.lower(Player.name) == opponent.lower()).first()
+        if not target: message = "That player account was not found."
+        elif target.name == name: message = "You cannot challenge yourself."
+        elif level not in LEVELS: message = "Choose a valid difficulty."
+        else:
+            db.session.add(Challenge(creator=name, opponent=target.name, level=level))
+            db.session.commit()
+            message = f"Challenge sent to {target.name}!"
+    items = Challenge.query.filter((Challenge.creator == name) | (Challenge.opponent == name)).order_by(Challenge.id.desc()).limit(30).all()
+    rows = "".join(f"<li>{c.creator} vs {c.opponent} · {c.level} · {c.status}</li>" for c in items)
+    return f"""<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;background:#1e1b4b;color:white;padding:24px'><h1>🤝 Player Challenges</h1><p>{message}</p><form method='post'><input name='opponent' maxlength='20' placeholder='Opponent username' required><select name='level'><option>easy</option><option selected>medium</option><option>hard</option></select><button>Send challenge</button></form><h3>Your challenges</h3><ul>{rows or '<li>No challenges yet</li>'}</ul><p class='muted'>Challenge requests are saved. Live head-to-head play still needs a separate match flow.</p><a style='color:#facc15' href='/'>Back to game</a></body></html>"""
 
 
 @app.route("/stats")
