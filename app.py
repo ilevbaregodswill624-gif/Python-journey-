@@ -1,16 +1,39 @@
+import hmac
 import os
 import re
 import random
+import secrets
 from datetime import datetime, timedelta, date
 from flask import Flask, request, render_template, session, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
 from jinja2 import DictLoader
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 
+# Local dev only: run with FLASK_DEBUG=1. Anything else is treated as production.
+IS_DEBUG = os.environ.get("FLASK_DEBUG") == "1"
+
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me")
+
+_secret_key = os.environ.get("SECRET_KEY")
+if not _secret_key:
+    if not IS_DEBUG:
+        raise RuntimeError(
+            "SECRET_KEY is not set. Set it to a long random string "
+            "(or run with FLASK_DEBUG=1 for local development)."
+        )
+    _secret_key = "dev-only-change-me"
+app.secret_key = _secret_key
+
 app.permanent_session_lifetime = timedelta(days=365)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    # Secure cookies need HTTPS. Defaults on in production, off in debug;
+    # override with COOKIE_SECURE=0 or 1 if needed.
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0" if IS_DEBUG else "1") == "1",
+)
 
 db_url = os.environ.get("DATABASE_URL", "sqlite:///game.db")
 if db_url.startswith("postgres://"):
@@ -89,6 +112,27 @@ class ChallengeMatch(db.Model):
     secret = db.Column(db.Integer, nullable=False)
 
 
+class ChallengePlayerState(db.Model):
+    # Per-player state lets each person play at their own pace without a speed advantage.
+    id = db.Column(db.Integer, primary_key=True)
+    challenge_id = db.Column(db.Integer, db.ForeignKey("challenge.id"), nullable=False)
+    name = db.Column(db.String(20), nullable=False)
+    ready = db.Column(db.Boolean, default=False, nullable=False)
+    attempts = db.Column(db.Integer, default=0, nullable=False)
+    guesses = db.Column(db.Text, default="", nullable=False)
+    solved = db.Column(db.Boolean, default=False, nullable=False)
+    finished = db.Column(db.Boolean, default=False, nullable=False)
+    __table_args__ = (db.UniqueConstraint("challenge_id", "name", name="uq_challenge_player_state"),)
+
+
+class ChallengeMessage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    challenge_id = db.Column(db.Integer, db.ForeignKey("challenge.id"), nullable=False, index=True)
+    sender = db.Column(db.String(20), nullable=False)
+    body = db.Column(db.String(300), nullable=False)
+    created = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
 class Game(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(20), nullable=False, index=True)
@@ -97,6 +141,24 @@ class Game(db.Model):
     attempts = db.Column(db.Integer, nullable=False)
     secret = db.Column(db.Integer, nullable=False)
     created = db.Column(db.DateTime, server_default=func.now())
+
+
+class ActiveGame(db.Model):
+    # In-progress solo game. Lives server-side so the secret never reaches the browser
+    # and attempts cannot be reset by replaying an old cookie. One row per player.
+    name = db.Column(db.String(20), primary_key=True)
+    level = db.Column(db.String(10), nullable=False)
+    secret = db.Column(db.Integer, nullable=False)
+    attempts = db.Column(db.Integer, default=0, nullable=False)
+
+
+class DailyWinBonus(db.Model):
+    # Tracks the once-per-day +20 XP win bonus. Kept apart from DailyReward, which
+    # belongs to the /claim-daily login reward.
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(20), nullable=False, index=True)
+    bonus_date = db.Column(db.String(10), nullable=False)
+    __table_args__ = (db.UniqueConstraint("name", "bonus_date", name="uq_daily_win_bonus"),)
 
 
 with app.app_context():
@@ -110,6 +172,62 @@ def bump(name):
         db.session.add(row)
     row.value += 1
     db.session.commit()
+
+
+def csrf_token():
+    token = session.get("_csrf")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf"] = token
+    return token
+
+
+def csrf_field():
+    return f'<input type="hidden" name="csrf_token" value="{csrf_token()}">'
+
+
+@app.before_request
+def csrf_protect():
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        expected = session.get("_csrf", "")
+        sent = request.form.get("csrf_token", "")
+        if not expected or not hmac.compare_digest(sent, expected):
+            return "Your session expired or the form was invalid. Go back, refresh the page and try again.", 400
+
+
+def get_active_game(name, level, lock=False):
+    """Return the player's in-progress game for `level`, creating or resetting it as needed.
+
+    Only flushes; the caller commits. With lock=True the row is locked (Postgres) so two
+    simultaneous guesses from the same player cannot both read the same attempt count.
+    """
+    hi, _ = LEVELS[level]
+    query = ActiveGame.query.filter_by(name=name)
+    if lock:
+        query = query.with_for_update()
+    game = query.first()
+    if game is None:
+        game = ActiveGame(name=name, level=level, secret=random.randint(1, hi), attempts=0)
+        db.session.add(game)
+        try:
+            db.session.flush()
+        except IntegrityError:
+            db.session.rollback()
+            game = ActiveGame.query.filter_by(name=name).with_for_update().first()
+    elif game.level != level:
+        game.level = level
+        game.secret = random.randint(1, hi)
+        game.attempts = 0
+    return game
+
+
+def claim_daily_win_bonus(name):
+    """Return 20 the first time a player wins on a given day, else 0."""
+    today = date.today().isoformat()
+    if DailyWinBonus.query.filter_by(name=name, bonus_date=today).first():
+        return 0
+    db.session.add(DailyWinBonus(name=name, bonus_date=today))
+    return 20
 
 
 BASE = """
@@ -166,6 +284,9 @@ BASE = """
     button, .btn { transition:transform .18s ease, filter .18s ease; }
     button:hover, .btn:hover { filter:brightness(1.06); transform:translateY(-1px); }
     select { width:100%; padding:13px; margin:8px 0; border:0; border-radius:10px; font-size:16px; }
+    button.linkbtn { display:inline; width:auto; margin:0; padding:0; background:none; color:#facc15;
+      font-size:inherit; font-weight:normal; text-decoration:underline; border:none; cursor:pointer; }
+    button.linkbtn:hover { filter:none; transform:none; }
   </style>
 </head>
 <body class="theme-{{ theme|default('purple') }}">
@@ -189,6 +310,7 @@ GAME = """
 {% if not player %}
   <p class="sub">Pick a name and a 4-digit PIN. New name? It's yours. Returning? Enter your PIN.</p>
   <form method="post" action="/name">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input name="name" maxlength="20" placeholder="Player name" required autofocus>
     <input name="pin" type="password" inputmode="numeric" pattern="[0-9]{4}"
            maxlength="4" placeholder="4-digit PIN" required>
@@ -198,7 +320,7 @@ GAME = """
   <div class="links"><a href="/leaderboard">Leaderboard</a></div>
   <p class="muted">Create an account to save XP, badges and progress.</p>
 {% else %}
-  <p class="sub">Playing as <b>{{ player }}</b> · <a href="/name">log out</a></p>
+  <div class="sub">Playing as <b>{{ player }}</b> · <form method="post" action="/logout" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit" class="linkbtn">log out</button></form></div>
   <p class="sub">⭐ Total XP: <b>{{ total_xp }}</b> · Level <b>{{ player_level }}</b></p>
   <p class="sub">🎁 Daily reward: {{ daily_status }}</p>
   <div class="nav"><a href="/profile">Profile</a><a href="/missions">Daily Missions</a><a href="/challenges">Challenges</a><a href="/progress">Progress</a><a href="/settings">Theme</a></div>
@@ -215,6 +337,7 @@ GAME = """
     <a class="btn" href="/">Play again 🔁</a>
   {% else %}
     <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="number" name="guess" min="1" max="{{ hi }}" placeholder="?" required autofocus>
       <button type="submit">Guess</button>
     </form>
@@ -298,7 +421,8 @@ app.jinja_loader = DictLoader({
 
 @app.context_processor
 def inject_analytics():
-    return {"analytics": os.environ.get("ANALYTICS_SCRIPT", ""), "theme": session.get("theme", "purple")}
+    return {"analytics": os.environ.get("ANALYTICS_SCRIPT", ""), "theme": session.get("theme", "purple"),
+            "csrf_token": csrf_token}
 
 
 def get_xp(name):
@@ -359,10 +483,15 @@ def update_daily_missions(name, won, level, attempts):
                 award_xp(name, definition["reward"])
 
 
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.pop("player", None)
+    return redirect(url_for("home"))
+
+
 @app.route("/name", methods=["GET", "POST"])
 def set_name():
     if request.method == "GET":
-        session.pop("player", None)
         return redirect(url_for("home"))
 
     name = request.form.get("name", "").strip()[:20]
@@ -416,17 +545,22 @@ def home():
     login_error = session.pop("login_error", None)
 
     new_level = request.args.get("level")
+    # The secret number and attempt count live in the database, never in the cookie.
+    # Drop anything an older version of this app left in the session.
+    session.pop("secret", None)
+    session.pop("attempts", None)
+
     if request.method == "GET" and new_level in LEVELS:
         session["level"] = new_level
-        session.pop("secret", None)
-        session.pop("attempts", None)
+        if player:
+            ActiveGame.query.filter_by(name=player).delete()
+            db.session.commit()
 
     level = session.get("level", "medium")
     hi, max_tries = LEVELS[level]
 
-    if "secret" not in session:
-        session["secret"] = random.randint(1, hi)
-        session["attempts"] = 0
+    game = get_active_game(player, level, lock=request.method == "POST") if player else None
+    attempts = game.attempts if game else 0
 
     message, kind, over = "", "", False
     if login_error:
@@ -441,9 +575,9 @@ def home():
         if guess is None or not 1 <= guess <= hi:
             message, kind = f"Pick a number from 1 to {hi}", "high"
         else:
-            session["attempts"] += 1
-            tries = session["attempts"]
-            secret = session["secret"]
+            game.attempts += 1
+            tries = attempts = game.attempts
+            secret = game.secret
 
             if guess == secret:
                 message = f"You got it in {tries} attempts! 🎉 Saved to the leaderboard."
@@ -452,9 +586,10 @@ def home():
                 db.session.add(Game(name=player, level=level, won=True,
                                     attempts=tries, secret=secret))
                 xp_reward = max(5, 35 - (tries * 5))
-                daily_bonus = 20 if not DailyReward.query.filter_by(name=player, reward_date=date.today().isoformat()).first() else 0
+                daily_bonus = claim_daily_win_bonus(player)
                 award_xp(player, xp_reward + daily_bonus)
                 update_daily_missions(player, True, level, tries)
+                db.session.delete(game)
                 db.session.commit()
                 message += f" ⭐ +{xp_reward} XP!"
                 if daily_bonus:
@@ -469,6 +604,7 @@ def home():
                                     attempts=tries, secret=secret))
                 award_xp(player, 5)
                 update_daily_missions(player, False, level, tries)
+                db.session.delete(game)
                 db.session.commit()
                 message += " ⭐ +5 XP for playing!"
                 bump("games_played")
@@ -493,10 +629,8 @@ def home():
                 else:
                     message, kind = "Too high 📈", "high"
 
-    attempts = session["attempts"]
-    if over:
-        session.pop("secret")
-        session.pop("attempts")
+    if player:
+        db.session.commit()  # saves the new attempt count after a wrong guess
 
     best = None
     total_xp = 0
@@ -592,10 +726,10 @@ def profile():
     wins = sum(1 for g in games if g.won)
     xp = get_xp(name)
     claimed = DailyReward.query.filter_by(name=name, reward_date=date.today().isoformat()).first() is not None
-    return f"""<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;background:#1e1b4b;color:white;padding:24px'><h1>👤 {name}'s Profile</h1><p>⭐ XP: {xp}</p><p>Level: {get_level(xp)}</p><p>Games played: {len(games)}</p><p>Wins: {wins}</p><p>Badges: {', '.join(get_badges(name)) or 'None yet'}</p><p>Daily reward: {'Already claimed today' if claimed else 'Ready to claim'}</p><p><a style='color:#facc15' href='/claim-daily'>Claim daily login reward</a></p><p><a style='color:#facc15' href='/missions'>Daily missions</a> · <a style='color:#facc15' href='/challenges'>Challenges</a></p><p><a style='color:#facc15' href='/change-pin'>Change PIN</a></p><p><a style='color:#facc15' href='/'>Back to game</a></p></body></html>"""
+    return f"""<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;background:#1e1b4b;color:white;padding:24px'><h1>👤 {name}'s Profile</h1><p>⭐ XP: {xp}</p><p>Level: {get_level(xp)}</p><p>Games played: {len(games)}</p><p>Wins: {wins}</p><p>Badges: {', '.join(get_badges(name)) or 'None yet'}</p><p>Daily reward: {'Already claimed today' if claimed else 'Ready to claim'}</p><form method='post' action='/claim-daily'><input type='hidden' name='csrf_token' value='{csrf_token()}'><button style='padding:10px 14px;border:0;border-radius:10px;background:#facc15;color:#1e1b4b;font-weight:bold;cursor:pointer'>Claim daily login reward</button></form><p><a style='color:#facc15' href='/missions'>Daily missions</a> · <a style='color:#facc15' href='/challenges'>Challenges</a></p><p><a style='color:#facc15' href='/change-pin'>Change PIN</a></p><p><a style='color:#facc15' href='/'>Back to game</a></p></body></html>"""
 
 
-@app.route("/claim-daily")
+@app.route("/claim-daily", methods=["POST"])
 def claim_daily():
     name = session.get("player")
     if not name: return redirect(url_for("home"))
@@ -604,7 +738,11 @@ def claim_daily():
         return "Daily reward already claimed today. <a href='/profile'>Back</a>"
     db.session.add(DailyReward(name=name, reward_date=today))
     award_xp(name, 10)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()  # double-click / parallel request: the other one already paid out
+        return "Daily reward already claimed today. <a href='/profile'>Back</a>"
     return "🎁 You claimed 10 XP! <a href='/profile'>Back to profile</a>"
 
 
@@ -623,7 +761,7 @@ def change_pin():
         player.pin_hash = generate_password_hash(new_pin)
         db.session.commit()
         return "PIN updated successfully. <a href='/profile'>Back to profile</a>"
-    return """<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;padding:24px'><h2>Change PIN</h2><form method='post'><input name='old_pin' type='password' inputmode='numeric' placeholder='Current PIN' required><br><input name='new_pin' type='password' inputmode='numeric' pattern='[0-9]{4}' maxlength='4' placeholder='New 4-digit PIN' required><br><button>Change PIN</button></form></body></html>"""
+    return """<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;padding:24px'><h2>Change PIN</h2><form method='post'><input type='hidden' name='csrf_token' value='__CSRF__'><input name='old_pin' type='password' inputmode='numeric' placeholder='Current PIN' required><br><input name='new_pin' type='password' inputmode='numeric' pattern='[0-9]{4}' maxlength='4' placeholder='New 4-digit PIN' required><br><button>Change PIN</button></form></body></html>""".replace("__CSRF__", csrf_token())
 
 
 @app.route("/settings", methods=["GET", "POST"])
@@ -633,7 +771,7 @@ def settings():
         theme = request.form.get("theme", "purple")
         if theme in {"purple", "ocean", "sunset", "dark"}: session["theme"] = theme
         return redirect(url_for("settings"))
-    return """<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;background:#1e1b4b;color:white;padding:24px'><h2>🎨 Choose a theme</h2><form method='post'><select name='theme'><option value='purple'>Purple</option><option value='ocean'>Ocean</option><option value='sunset'>Sunset</option><option value='dark'>Dark</option></select><button>Save theme</button></form><p><a style='color:#facc15' href='/'>Back to game</a></p></body></html>"""
+    return """<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;background:#1e1b4b;color:white;padding:24px'><h2>🎨 Choose a theme</h2><form method='post'><input type='hidden' name='csrf_token' value='__CSRF__'><select name='theme'><option value='purple'>Purple</option><option value='ocean'>Ocean</option><option value='sunset'>Sunset</option><option value='dark'>Dark</option></select><button>Save theme</button></form><p><a style='color:#facc15' href='/'>Back to game</a></p></body></html>""".replace("__CSRF__", csrf_token())
 
 
 @app.route("/progress")
@@ -705,8 +843,8 @@ def challenges():
         actions = ""
         if incoming and c.status == "pending":
             actions = f'''<div class="actions">
-              <form method="post"><input type="hidden" name="challenge_id" value="{c.id}"><input type="hidden" name="action" value="accept"><button type="submit">✓ Accept</button></form>
-              <form method="post"><input type="hidden" name="challenge_id" value="{c.id}"><input type="hidden" name="action" value="decline"><button class="decline" type="submit">✕ Decline</button></form>
+              <form method="post">{csrf_field()}<input type="hidden" name="challenge_id" value="{c.id}"><input type="hidden" name="action" value="accept"><button type="submit">✓ Accept</button></form>
+              <form method="post">{csrf_field()}<input type="hidden" name="challenge_id" value="{c.id}"><input type="hidden" name="action" value="decline"><button class="decline" type="submit">✕ Decline</button></form>
             </div>'''
         match_link = f'<p><a href="/challenge/{c.id}">▶ Open match</a></p>' if c.status == "accepted" else ""
         result_line = ""
@@ -735,11 +873,11 @@ h1{{margin:0 0 8px}} .muted{{opacity:.78;font-size:14px}} input,select{{width:10
 .actions{{display:flex;gap:8px;margin-top:12px}} .actions form{{flex:1}} .actions button{{margin:0}} .actions .decline{{background:#fda4af;color:#4c0519}} a{{color:#fde047}} .back{{display:block;margin-top:14px;text-align:center}} @media(max-width:480px){{.panel{{padding:18px}}.actions{{flex-direction:column}}}}
 </style></head><body><main class="wrap">
 <section class="panel"><h1>🤝 Player Challenges</h1><p class="muted">Challenge another player or respond to requests sent to you.</p>{message_html}
-<form method="post"><input type="hidden" name="action" value="send"><label for="opponent">Opponent username</label><input id="opponent" name="opponent" maxlength="20" placeholder="Enter exact player name" required>
+<form method="post">{csrf_field()}<input type="hidden" name="action" value="send"><label for="opponent">Opponent username</label><input id="opponent" name="opponent" maxlength="20" placeholder="Enter exact player name" required>
 <label for="level">Difficulty</label><select id="level" name="level"><option value="easy">Easy</option><option value="medium" selected>Medium</option><option value="hard">Hard</option></select><button type="submit">Send challenge →</button></form>
 <a class="back" href="/">← Back to game</a></section>
 <section class="panel"><h2>📬 Your challenges</h2>{''.join(cards) if cards else '<p class="muted">No challenges yet. Send your first one!</p>'}
-<p class="muted">Both players guess the same hidden number. The first correct guess wins and earns bonus XP.</p></section>
+<p class="muted">Both players get the same number and attempt limit. Each plays at their own pace; fewer attempts wins. Chat is available inside each match.</p></section>
 </main></body></html>'''
 
 @app.route("/challenge/<int:challenge_id>", methods=["GET", "POST"])
@@ -750,94 +888,151 @@ def challenge_match(challenge_id):
     challenge = db.session.get(Challenge, challenge_id)
     if not challenge or name not in {challenge.creator, challenge.opponent}:
         return "Challenge not found.", 404
-    if challenge.status != "accepted":
+    if challenge.status != "accepted" and challenge.status != "completed":
         return redirect(url_for("challenges"))
+
     match = ChallengeMatch.query.filter_by(challenge_id=challenge.id).first()
     if match is None:
         hi, _ = LEVELS[challenge.level]
         match = ChallengeMatch(challenge_id=challenge.id, secret=random.randint(1, hi))
         db.session.add(match)
-        db.session.commit()
-    is_creator = name == challenge.creator
+
+    # Create state rows lazily so existing accepted challenges and databases keep working.
+    states = {}
+    for player_name in (challenge.creator, challenge.opponent):
+        state = ChallengePlayerState.query.filter_by(challenge_id=challenge.id, name=player_name).first()
+        if state is None:
+            state = ChallengePlayerState(challenge_id=challenge.id, name=player_name)
+            # Preserve attempt counts from matches created by the previous version.
+            old_attempts = challenge.creator_attempts if player_name == challenge.creator else challenge.opponent_attempts
+            state.attempts = old_attempts or 0
+            old_won = challenge.creator_won if player_name == challenge.creator else challenge.opponent_won
+            state.solved = bool(old_won)
+            state.finished = bool(old_won) or state.attempts >= LEVELS[challenge.level][1]
+            db.session.add(state)
+        states[player_name] = state
+    db.session.commit()
+    mine = states[name]
+    other_name = challenge.opponent if name == challenge.creator else challenge.creator
+    other = states[other_name]
     hi, max_tries = LEVELS[challenge.level]
-    message = "Both players are guessing the same hidden number. First correct guess wins."
-    kind = "info"
-    player_attempts = challenge.creator_attempts if is_creator else challenge.opponent_attempts
-    player_attempts = player_attempts or 0
-    other_name = challenge.opponent if is_creator else challenge.creator
-    other_attempts = challenge.opponent_attempts if is_creator else challenge.creator_attempts
-    other_won = challenge.opponent_won if is_creator else challenge.creator_won
+    message, kind = "Get ready! Both players must mark themselves ready before the match begins.", "info"
 
     if request.method == "POST":
-        try:
-            guess = int(request.form.get("guess", ""))
-        except ValueError:
-            guess = None
-        if guess is None or not 1 <= guess <= hi:
-            message, kind = f"Enter a number from 1 to {hi}.", "error"
-        elif player_attempts >= max_tries:
-            message, kind = "You've used all your attempts.", "error"
-        elif (challenge.creator_won is True or challenge.opponent_won is True):
-            message, kind = "This match has already been decided.", "error"
-        else:
-            player_attempts += 1
-            if is_creator:
-                challenge.creator_attempts = player_attempts
-            else:
-                challenge.opponent_attempts = player_attempts
-            if guess == match.secret:
-                if is_creator:
-                    challenge.creator_won = True
-                    challenge.opponent_won = False
-                else:
-                    challenge.opponent_won = True
-                    challenge.creator_won = False
-                challenge.status = "completed"
-                award_xp(name, 50)
-                db.session.add(Game(name=name, level=challenge.level, won=True,
-                                    attempts=player_attempts, secret=match.secret))
-                message = f"Correct! You won the challenge and earned 50 XP! 🎉"
-                kind = "success"
-            elif player_attempts >= max_tries:
-                if is_creator:
-                    challenge.creator_won = False
-                else:
-                    challenge.opponent_won = False
-                # Only end the match when both players have used all attempts.
-                creator_done = (challenge.creator_attempts or 0) >= max_tries
-                opponent_done = (challenge.opponent_attempts or 0) >= max_tries
-                if creator_done and opponent_done:
-                    challenge.status = "completed"
-                    challenge.creator_won = False
-                    challenge.opponent_won = False
-                    message = f"Both players ran out of attempts. The number was {match.secret}. It's a draw."
-                else:
-                    message = f"No attempts left for you. {other_name} can still play."
-                kind = "error"
-            else:
-                if guess < match.secret:
-                    message, kind = "Too low! 🔥" if match.secret - guess <= 3 else "Too low 📉", "info"
-                else:
-                    message, kind = "Too high! 🔥" if guess - match.secret <= 3 else "Too high 📈", "info"
+        action = request.form.get("action", "guess")
+        if action == "ready":
+            mine.ready = True
             db.session.commit()
-            player_attempts = challenge.creator_attempts if is_creator else challenge.opponent_attempts
-            player_attempts = player_attempts or 0
-            other_attempts = challenge.opponent_attempts if is_creator else challenge.creator_attempts
-            other_attempts = other_attempts or 0
+            if states[challenge.creator].ready and states[challenge.opponent].ready:
+                message, kind = "Both players are ready! The match is live. Play at your own pace; speed does not decide the winner.", "success"
+            else:
+                message, kind = "You're ready. Waiting for the other player to get ready.", "success"
+        elif action == "chat":
+            body = request.form.get("message", "").strip()
+            if not body:
+                message, kind = "Type a message first.", "error"
+            elif len(body) > 300:
+                message, kind = "Messages must be 300 characters or fewer.", "error"
+            else:
+                db.session.add(ChallengeMessage(challenge_id=challenge.id, sender=name, body=body))
+                db.session.commit()
+                message, kind = "Message sent.", "success"
+        elif action == "guess":
+            if not (states[challenge.creator].ready and states[challenge.opponent].ready):
+                message, kind = "The match starts only after both players are ready.", "error"
+            elif challenge.status == "completed":
+                message, kind = "This match has already ended.", "error"
+            elif mine.finished:
+                message, kind = "You've finished your guesses. You can wait and chat while your opponent finishes.", "error"
+            else:
+                try:
+                    guess = int(request.form.get("guess", ""))
+                except (TypeError, ValueError):
+                    guess = None
+                if guess is None or not 1 <= guess <= hi:
+                    message, kind = f"Enter a number from 1 to {hi}.", "error"
+                else:
+                    mine.attempts += 1
+                    previous = [x for x in mine.guesses.split(",") if x]
+                    previous.append(str(guess))
+                    mine.guesses = ",".join(previous)
+                    if guess == match.secret:
+                        mine.solved = True
+                        mine.finished = True
+                        message, kind = "Correct! You've solved it. Your opponent can finish their own guesses; the winner is decided fairly after both finish. 🎯", "success"
+                    elif mine.attempts >= max_tries:
+                        mine.finished = True
+                        message, kind = "No attempts left. You can chat while waiting for your opponent.", "error"
+                    else:
+                        message = "Too low! 🔥" if guess < match.secret else "Too high! 📈"
+                        kind = "info"
+                    if name == challenge.creator:
+                        challenge.creator_attempts = mine.attempts
+                        challenge.creator_won = mine.solved
+                    else:
+                        challenge.opponent_attempts = mine.attempts
+                        challenge.opponent_won = mine.solved
+                    # Finish only when BOTH players are done. Attempt count beats speed; equal scores draw.
+                    if states[challenge.creator].finished and states[challenge.opponent].finished:
+                        cstate, ostate = states[challenge.creator], states[challenge.opponent]
+                        if cstate.solved and not ostate.solved:
+                            winner = challenge.creator
+                        elif ostate.solved and not cstate.solved:
+                            winner = challenge.opponent
+                        elif cstate.solved and ostate.solved and cstate.attempts < ostate.attempts:
+                            winner = challenge.creator
+                        elif cstate.solved and ostate.solved and ostate.attempts < cstate.attempts:
+                            winner = challenge.opponent
+                        else:
+                            winner = None
+                        challenge.status = "completed"
+                        challenge.creator_won = winner == challenge.creator
+                        challenge.opponent_won = winner == challenge.opponent
+                        if winner:
+                            award_xp(winner, 50)
+                            db.session.add(Game(name=winner, level=challenge.level, won=True,
+                                                attempts=states[winner].attempts, secret=match.secret))
+                        message = (f"🏆 {winner} wins and earns 50 XP!" if winner else
+                                   "🤝 It's a draw! Both players finished with the same result or neither solved it.")
+                        kind = "success"
+                    db.session.commit()
+        else:
+            message, kind = "Unknown action.", "error"
 
+        # Refresh state after POST so the page shows the latest status.
+        db.session.expire_all()
+        challenge = db.session.get(Challenge, challenge_id)
+        mine = ChallengePlayerState.query.filter_by(challenge_id=challenge.id, name=name).first()
+        other = ChallengePlayerState.query.filter_by(challenge_id=challenge.id, name=other_name).first()
+        states = {name: mine, other_name: other}
+
+    both_ready = states[challenge.creator].ready and states[challenge.opponent].ready
     if challenge.status == "completed":
-        if challenge.creator_won is True:
+        if challenge.creator_won:
             result = f"🏆 {challenge.creator} won the match!"
-        elif challenge.opponent_won is True:
+        elif challenge.opponent_won:
             result = f"🏆 {challenge.opponent} won the match!"
         else:
             result = "🤝 The match ended in a draw."
-        message = result
+    elif not both_ready:
+        result = f"Your status: {'Ready ✅' if mine.ready else 'Not ready'} · {other_name}: {'Ready ✅' if other.ready else 'Waiting ⏳'}"
     else:
-        result = f"Your attempts: {player_attempts}/{max_tries} · Opponent attempts: {other_attempts or 0}/{max_tries}"
-    disabled = challenge.status == "completed" or player_attempts >= max_tries
-    form = "<p>The match is finished.</p>" if disabled else f'''<form method="post"><input type="number" name="guess" min="1" max="{hi}" placeholder="Guess 1–{hi}" required><button type="submit">Submit guess</button></form>'''
-    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Challenge Match</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:24px 14px;background:linear-gradient(135deg,#1e1b4b,#4c1d95,#be185d);color:white;font-family:Arial,sans-serif}}main{{max-width:560px;margin:auto}}section{{padding:24px;border-radius:18px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.18)}}input,button{{width:100%;padding:14px;margin:8px 0;border:0;border-radius:10px;font-size:17px}}button{{background:#facc15;color:#1e1b4b;font-weight:bold}}a{{color:#fde047}}.msg{{padding:12px;border-radius:10px;background:rgba(0,0,0,.18)}}.error{{color:#fda4af}}.success{{color:#86efac}}</style></head><body><main><section><h1>⚔️ {challenge.creator} vs {challenge.opponent}</h1><p>{challenge.level.title()} · Number from 1 to {hi}</p><p class="msg {kind}">{message}</p><p>{result}</p>{form}<p><a href="/challenges">← Back to challenges</a></p></section></main></body></html>'''
+        result = f"Your attempts: {mine.attempts}/{max_tries} · Opponent attempts: {other.attempts}/{max_tries} · Your status: {'Finished' if mine.finished else 'Playing'}"
+
+    if challenge.status != "completed" and not mine.ready:
+        game_form = f'<form method="post">{csrf_field()}<input type="hidden" name="action" value="ready"><button type="submit">I\'m ready</button></form>'
+    elif not both_ready and challenge.status != "completed":
+        game_form = '<p>Waiting for the other player to press “I\'m ready”.</p>'
+    elif challenge.status != "completed" and not mine.finished:
+        game_form = f'''<form method="post">{csrf_field()}<input type="hidden" name="action" value="guess"><label for="guess">Your guess (1–{hi})</label><input id="guess" type="number" name="guess" min="1" max="{hi}" required><button type="submit">Submit guess</button></form>'''
+    else:
+        game_form = '<p>You have finished. Chat with your opponent while waiting for the match to conclude.</p>'
+
+    chat_rows = ChallengeMessage.query.filter_by(challenge_id=challenge.id).order_by(ChallengeMessage.id.desc()).limit(30).all()
+    chat_rows.reverse()
+    chat_html = ''.join(f'<p class="chatline"><strong>{m.sender}</strong>: {m.body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")}</p>' for m in chat_rows) or '<p class="muted">No messages yet. Be civil-ish. 😅</p>'
+    chat_form = f'''<form method="post">{csrf_field()}<input type="hidden" name="action" value="chat"><label for="message">Message</label><input id="message" name="message" maxlength="300" placeholder="Send a message…" required><button type="submit">Send message</button></form>'''
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Challenge Match</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:24px 14px;background:linear-gradient(135deg,#1e1b4b,#4c1d95,#be185d);color:white;font-family:Arial,sans-serif}}main{{max-width:600px;margin:auto}}section{{padding:22px;margin-bottom:16px;border-radius:18px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.18)}}input,button{{width:100%;padding:13px;margin:8px 0;border:0;border-radius:10px;font-size:16px}}button{{background:#facc15;color:#1e1b4b;font-weight:bold;cursor:pointer}}a{{color:#fde047}}.msg{{padding:12px;border-radius:10px;background:rgba(0,0,0,.18)}}.error{{color:#fda4af}}.success{{color:#86efac}}.muted{{opacity:.75}}.chatline{{padding:9px;background:rgba(0,0,0,.15);border-radius:8px;overflow-wrap:anywhere}}</style></head><body><main><section><h1>⚔️ {challenge.creator} vs {challenge.opponent}</h1><p>{challenge.level.title()} · Number from 1 to {hi}</p><p class="msg {kind}">{message}</p><p>{result}</p>{game_form}<p class="muted">Fair play: both players finish independently. The faster player does not automatically win. Fewer attempts wins; ties are draws. Your progress is saved.</p><p><a href="/challenges">← Back to challenges</a></p></section><section><h2>💬 Match chat</h2>{chat_html}{chat_form}</section></main></body></html>'''
 
 
 @app.route("/stats")
@@ -853,4 +1048,4 @@ def stats():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=IS_DEBUG)
