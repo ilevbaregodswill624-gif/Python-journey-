@@ -143,6 +143,12 @@ BASE = """
     body.theme-sunset { background:linear-gradient(135deg,#7c2d12,#c2410c,#9d174d); }
     body.theme-dark { background:linear-gradient(135deg,#09090b,#27272a,#18181b); }
     .muted { opacity:.8; font-size:14px; }
+    a { transition: .18s ease; }
+    .links a, .nav a { display:inline-block; padding:9px 13px; border-radius:10px; background:rgba(250,204,21,.10); text-decoration:none; }
+    .links a:hover, .nav a:hover { background:#facc15; color:#1e1b4b; transform:translateY(-1px); }
+    button, .btn { transition:transform .18s ease, filter .18s ease; }
+    button:hover, .btn:hover { filter:brightness(1.06); transform:translateY(-1px); }
+    select { width:100%; padding:13px; margin:8px 0; border:0; border-radius:10px; font-size:16px; }
   </style>
 </head>
 <body class="theme-{{ theme|default('purple') }}">
@@ -521,8 +527,7 @@ def profile():
     wins = sum(1 for g in games if g.won)
     xp = get_xp(name)
     claimed = DailyReward.query.filter_by(name=name, reward_date=date.today().isoformat()).first() is not None
-    return f"""<html><meta
-    content='width=device-width, initial-scale=1'><body style='font-family:Arial;background:#1e1b4b;color:white;padding:24px'><h1>👤 {name}'s Profile</h1><p>⭐ XP: {xp}</p><p>Level: {get_level(xp)}</p><p>Games played: {len(games)}</p><p>Wins: {wins}</p><p>Badges: {', '.join(get_badges(name)) or 'None yet'}</p><p>Daily reward: {'Already claimed today' if claimed else 'Ready to claim'}</p><p><a style='color:#facc15' href='/claim-daily'>Claim daily login reward</a></p><p><a style='color:#facc15' href='/change-pin'>Change PIN</a></p><p><a style='color:#facc15' href='/'>Back to game</a></p></body></html>"""
+    return f"""<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;background:#1e1b4b;color:white;padding:24px'><h1>👤 {name}'s Profile</h1><p>⭐ XP: {xp}</p><p>Level: {get_level(xp)}</p><p>Games played: {len(games)}</p><p>Wins: {wins}</p><p>Badges: {', '.join(get_badges(name)) or 'None yet'}</p><p>Daily reward: {'Already claimed today' if claimed else 'Ready to claim'}</p><p><a style='color:#facc15' href='/claim-daily'>Claim daily login reward</a></p><p><a style='color:#facc15' href='/change-pin'>Change PIN</a></p><p><a style='color:#facc15' href='/'>Back to game</a></p></body></html>"""
 
 
 @app.route("/claim-daily")
@@ -579,23 +584,86 @@ def progress():
 @app.route("/challenges", methods=["GET", "POST"])
 def challenges():
     name = session.get("player")
-    if not name: return redirect(url_for("home"))
-    message = ""
-    if request.method == "POST":
-        opponent = request.form.get("opponent", "").strip()
-        level = request.form.get("level", "medium")
-        target = Player.query.filter(func.lower(Player.name) == opponent.lower()).first()
-        if not target: message = "That player account was not found."
-        elif target.name == name: message = "You cannot challenge yourself."
-        elif level not in LEVELS: message = "Choose a valid difficulty."
-        else:
-            db.session.add(Challenge(creator=name, opponent=target.name, level=level))
-            db.session.commit()
-            message = f"Challenge sent to {target.name}!"
-    items = Challenge.query.filter((Challenge.creator == name) | (Challenge.opponent == name)).order_by(Challenge.id.desc()).limit(30).all()
-    rows = "".join(f"<li>{c.creator} vs {c.opponent} · {c.level} · {c.status}</li>" for c in items)
-    return f"""<html><meta name='viewport' content='width=device-width, initial-scale=1'><body style='font-family:Arial;background:#1e1b4b;color:white;padding:24px'><h1>🤝 Player Challenges</h1><p>{message}</p><form method='post'><input name='opponent' maxlength='20' placeholder='Opponent username' required><select name='level'><option>easy</option><option selected>medium</option><option>hard</option></select><button>Send challenge</button></form><h3>Your challenges</h3><ul>{rows or '<li>No challenges yet</li>'}</ul><p class='muted'>Challenge requests are saved. Live head-to-head play still needs a separate match flow.</p><a style='color:#facc15' href='/'>Back to game</a></body></html>"""
+    if not name:
+        return redirect(url_for("home"))
 
+    message = ""
+    message_kind = "info"
+    if request.method == "POST":
+        action = request.form.get("action", "send")
+        if action in {"accept", "decline"}:
+            try:
+                challenge_id = int(request.form.get("challenge_id", ""))
+            except ValueError:
+                challenge_id = 0
+            challenge = db.session.get(Challenge, challenge_id)
+            if not challenge:
+                message, message_kind = "Challenge not found.", "error"
+            elif challenge.opponent != name:
+                message, message_kind = "Only the invited player can respond to this challenge.", "error"
+            elif challenge.status != "pending":
+                message, message_kind = "This challenge has already been answered.", "error"
+            elif action == "accept":
+                challenge.status = "accepted"
+                db.session.commit()
+                message, message_kind = f"You accepted {challenge.creator}'s challenge!", "success"
+            else:
+                challenge.status = "declined"
+                db.session.commit()
+                message, message_kind = "Challenge declined.", "success"
+        else:
+            opponent = request.form.get("opponent", "").strip()
+            level = request.form.get("level", "medium")
+            target = Player.query.filter(func.lower(Player.name) == opponent.lower()).first() if opponent else None
+            if not target:
+                message, message_kind = "That player account was not found.", "error"
+            elif target.name == name:
+                message, message_kind = "You cannot challenge yourself.", "error"
+            elif level not in LEVELS:
+                message, message_kind = "Choose a valid difficulty.", "error"
+            elif Challenge.query.filter_by(creator=name, opponent=target.name, status="pending").first():
+                message, message_kind = f"You already have a pending challenge for {target.name}.", "error"
+            else:
+                db.session.add(Challenge(creator=name, opponent=target.name, level=level, status="pending"))
+                db.session.commit()
+                message, message_kind = f"Challenge sent to {target.name}!", "success"
+
+    items = (Challenge.query.filter((Challenge.creator == name) | (Challenge.opponent == name))
+             .order_by(Challenge.id.desc()).limit(50).all())
+    cards = []
+    for c in items:
+        incoming = c.opponent == name and c.creator != name
+        direction = "Incoming challenge" if incoming else "Challenge you sent"
+        actions = ""
+        if incoming and c.status == "pending":
+            actions = f'''<div class="actions">
+              <form method="post"><input type="hidden" name="challenge_id" value="{c.id}"><input type="hidden" name="action" value="accept"><button type="submit">✓ Accept</button></form>
+              <form method="post"><input type="hidden" name="challenge_id" value="{c.id}"><input type="hidden" name="action" value="decline"><button class="decline" type="submit">✕ Decline</button></form>
+            </div>'''
+        cards.append(f'''<section class="challenge-card">
+          <div class="card-head"><strong>{c.creator} vs {c.opponent}</strong><span class="status">{c.status}</span></div>
+          <p>{direction} · {c.level.title()} difficulty</p>{actions}
+        </section>''')
+
+    safe_message = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    message_html = f'<p class="notice {message_kind}">{safe_message}</p>' if message else ""
+    return f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Player Challenges</title><style>
+*{{box-sizing:border-box}} body{{margin:0;padding:22px 14px;min-height:100vh;font-family:Arial,sans-serif;color:#fff;background:linear-gradient(135deg,#1e1b4b,#4c1d95,#be185d)}}
+.wrap{{max-width:680px;margin:0 auto}} .panel{{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.18);border-radius:20px;padding:24px;margin-bottom:16px;box-shadow:0 16px 38px rgba(0,0,0,.2)}}
+h1{{margin:0 0 8px}} .muted{{opacity:.78;font-size:14px}} input,select{{width:100%;padding:13px;margin:8px 0;border:0;border-radius:10px;font-size:16px}} button{{display:inline-block;width:100%;padding:13px;border:0;border-radius:10px;background:#facc15;color:#1e1b4b;font-size:15px;font-weight:bold;text-align:center;cursor:pointer}}
+.challenge-card{{padding:16px;margin:12px 0;border-radius:14px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14)}} .card-head{{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap}} .challenge-card p{{margin:8px 0 4px}}
+.status{{display:inline-block;padding:5px 10px;border-radius:999px;background:rgba(250,204,21,.18);color:#fde68a;font-size:12px;text-transform:capitalize}} .notice{{padding:12px;border-radius:10px;background:rgba(255,255,255,.1)}} .success{{color:#86efac}} .error{{color:#fda4af}}
+.actions{{display:flex;gap:8px;margin-top:12px}} .actions form{{flex:1}} .actions button{{margin:0}} .actions .decline{{background:#fda4af;color:#4c0519}} a{{color:#fde047}} .back{{display:block;margin-top:14px;text-align:center}} @media(max-width:480px){{.panel{{padding:18px}}.actions{{flex-direction:column}}}}
+</style></head><body><main class="wrap">
+<section class="panel"><h1>🤝 Player Challenges</h1><p class="muted">Challenge another player or respond to requests sent to you.</p>{message_html}
+<form method="post"><input type="hidden" name="action" value="send"><label for="opponent">Opponent username</label><input id="opponent" name="opponent" maxlength="20" placeholder="Enter exact player name" required>
+<label for="level">Difficulty</label><select id="level" name="level"><option value="easy">Easy</option><option value="medium" selected>Medium</option><option value="hard">Hard</option></select><button type="submit">Send challenge →</button></form>
+<a class="back" href="/">← Back to game</a></section>
+<section class="panel"><h2>📬 Your challenges</h2>{''.join(cards) if cards else '<p class="muted">No challenges yet. Send your first one!</p>'}
+<p class="muted">Accepting updates the request status. The actual head-to-head match screen is a separate feature to implement next.</p></section>
+</main></body></html>'''
 
 @app.route("/stats")
 def stats():
