@@ -25,11 +25,13 @@ app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 db = SQLAlchemy(app)
 
 # ---------------------------------------------------------------- config
-LEVELS = {"easy": (10, 7), "medium": (20, 5), "hard": (50, 6)}
+LEVELS = {"easy": (10, 7), "medium": (20, 5), "hard": (50, 6), "impossible": (100, 6)}
+UNLOCK_WINS = 5                 # wins needed before Impossible mode opens
+IMPOSSIBLE_START_CLUES = 2      # clues shown before the first guess (fewer = harder)
 MAX_FAILS = 5
 LOCK_MINUTES = 5
 
-CHALLENGE_SECONDS = {"easy": 90, "medium": 120, "hard": 180}  # match clock per level
+CHALLENGE_SECONDS = {"easy": 90, "medium": 120, "hard": 180, "impossible": 240}  # match clock per level
 INVITE_HOURS = 24        # pending invites expire after this long
 READY_MINUTES = 60       # accepted matches expire if nobody starts in this window
 ONLINE_SECONDS = 25      # seen within this window = online
@@ -264,21 +266,63 @@ def get_badges(name):
     if sum(1 for g in games if g.won) >= 10: badges.append("🔥 10 Wins")
     if xp >= 100: badges.append("⭐ 100 XP")
     if xp >= 500: badges.append("💎 500 XP")
+    if any(g.won and g.level == "impossible" for g in games): badges.append("💀 Impossible Winner")
     if duels: badges.append("⚔️ First Duel")
     if duel_wins: badges.append("👑 Duel Winner")
     return badges
 
 
-def hint_for(guess, secret):
+def hint_for(guess, secret, level=None):
     if guess == secret:
         return "Correct! 🎯", "win"
     d = abs(guess - secret)
     way = "low" if guess < secret else "high"
+    if level == "impossible":      # no hot/warm help in Impossible mode
+        return f"Too {way} " + ("📉" if way == "low" else "📈"), way
     if d <= 3:
         return f"Too {way}! 🔥 Very hot!", way
     if d <= 7:
         return f"Too {way}! 🌡️ Getting warm!", way
     return f"Too {way} " + ("📉" if way == "low" else "📈"), way
+
+
+# ---- Impossible mode
+def win_count(name):
+    if not name:
+        return 0
+    return Game.query.filter_by(name=name, won=True).count()
+
+
+def impossible_unlocked(name):
+    return win_count(name) >= UNLOCK_WINS
+
+
+def impossible_clues(secret, seed):
+    """Ordered list of TRUE clues about the secret. Same secret + seed = same clues."""
+    rng = random.Random(f"{seed}:{secret}")
+    lo = rng.randint(max(1, secret - 59), min(secret, 41))
+    pool = (3, 4, 5, 6, 7, 9, 11)
+    divisors = [k for k in pool if secret % k == 0]
+    if divisors:
+        div_text = f"➗ It divides evenly by {rng.choice(divisors)}."
+    else:
+        div_text = f"➗ It does NOT divide evenly by {rng.choice(pool)}."
+    m, c = rng.randint(2, 5), rng.randint(1, 20)
+    root = round(secret ** 0.5)
+    return [
+        "🔢 It's an even number." if secret % 2 == 0 else "🔢 It's an odd number.",
+        f"📏 It's somewhere between {lo} and {lo + 59}.",
+        div_text,
+        f"🧮 Its digits add up to {sum(int(d) for d in str(secret))}.",
+        "🟦 It IS a perfect square." if root * root == secret else "🟦 It is NOT a perfect square.",
+        f"🧠 Multiply it by {m}, then add {c}. You get {secret * m + c}.",
+        f"🔟 Its tens digit is {secret // 10 % 10}.",
+        f"🔚 Its last digit is {secret % 10}.",
+    ]
+
+
+def clues_shown(clues, wrong_guesses):
+    return clues[:min(len(clues), IMPOSSIBLE_START_CLUES + wrong_guesses)]
 
 
 # ---- presence & notifications
@@ -334,7 +378,7 @@ def solo_reset(level):
 # ---- missions
 MISSION_DEFINITIONS = {
     "win_two": {"title": "Win 2 games", "target": 2, "reward": 50, "description": "Win any two games today."},
-    "hard_win": {"title": "Hard mode victory", "target": 1, "reward": 75, "description": "Win one game on Hard difficulty."},
+    "hard_win": {"title": "Hard mode victory", "target": 1, "reward": 75, "description": "Win one game on Hard or Impossible difficulty."},
     "quick_win": {"title": "Quick thinker", "target": 1, "reward": 40, "description": "Win a game in 3 attempts or fewer."},
 }
 
@@ -350,7 +394,7 @@ def update_daily_missions(name, won, level, attempts):
         if mission.completed:
             continue
         should = ((key == "win_two" and won) or
-                  (key == "hard_win" and won and level == "hard") or
+                  (key == "hard_win" and won and level in ("hard", "impossible")) or
                   (key == "quick_win" and won and attempts <= 3))
         if should:
             mission.progress = min(definition["target"], mission.progress + 1)
@@ -561,6 +605,26 @@ BASE = r"""<!DOCTYPE html>
     .toast{pointer-events:auto;display:block;max-width:520px;width:100%;padding:13px 15px;border-radius:12px;
       background:#111827;color:#fff;text-decoration:none;box-shadow:0 10px 30px rgba(0,0,0,.4);
       border-left:4px solid var(--accent);font-size:15px}
+    .levels{flex-wrap:wrap}
+    .levels a{flex:1 1 70px;font-size:13px;padding:8px 4px}
+    .levels a.imp{flex-basis:110px;color:#fecaca}
+    .levels a.imp.on{background:#ef4444;color:#fff}
+    .levels a.locked{opacity:.55}
+    .clue{padding:8px 10px;margin:6px 0;border-radius:8px;background:rgba(255,255,255,.08);text-align:left;font-size:15px;animation:cluein .4s ease-out}
+    @keyframes cluein{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+    #epic{position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.78);padding:16px}
+    #epic.flash{animation:epicflash .9s ease-out}
+    @keyframes epicflash{0%{background:#fff}100%{background:rgba(0,0,0,.78)}}
+    #epicCanvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+    .epic-card{position:relative;width:100%;max-width:380px;padding:26px 22px;text-align:center;border-radius:22px;
+      background:linear-gradient(160deg,#450a0a,#1e1b4b);border:2px solid var(--accent);
+      box-shadow:0 0 60px rgba(250,204,21,.35);animation:epicpop .55s cubic-bezier(.2,1.4,.4,1)}
+    @keyframes epicpop{0%{transform:scale(.4);opacity:0}100%{transform:scale(1);opacity:1}}
+    .epic-skull{font-size:64px;line-height:1}
+    .epic-card h2{margin:8px 0;letter-spacing:1px;color:var(--accent)}
+    .epic-line{opacity:.9;margin:0 0 8px}
+    .epic-xp{font-size:44px;font-weight:bold;font-variant-numeric:tabular-nums;margin:6px 0 10px}
+    @media (prefers-reduced-motion:reduce){.epic-card,.clue,#epic.flash{animation:none}}
   </style>
 </head>
 <body class="theme-{{ theme }}" data-auth="{{ '1' if nav_player else '' }}" data-activity="{% block activity %}online{% endblock %}">
@@ -638,6 +702,88 @@ BASE = r"""<!DOCTYPE html>
 })();
 {% endraw %}
 </script>
+<script>
+{% raw %}
+(function(){
+  let raf = 0;
+  window.celebrate = function(o){
+    o = o || {};
+    window.__epic = true;
+    const old = document.getElementById('epic'); if (old) old.remove();
+    const calm = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const ov = document.createElement('div'); ov.id = 'epic';
+    const cv = document.createElement('canvas'); cv.id = 'epicCanvas';
+    const card = document.createElement('div'); card.className = 'epic-card';
+    const skull = document.createElement('div'); skull.className = 'epic-skull'; skull.textContent = '💀';
+    const h = document.createElement('h2'); h.textContent = 'IMPOSSIBLE CONQUERED';
+    const line = document.createElement('p'); line.className = 'epic-line';
+    line.textContent = Number(o.tries) === 1 ? 'First try?! Nobody does that.' : 'Solved in ' + Number(o.tries) + ' tries. Most people never get here.';
+    const xp = document.createElement('div'); xp.className = 'epic-xp'; xp.textContent = '+0 XP';
+    const go = document.createElement('button'); go.type = 'button'; go.textContent = "Let's go 🔥";
+    const sh = document.createElement('button'); sh.type = 'button'; sh.className = 'alt'; sh.textContent = 'Share the W 📤';
+    card.append(skull, h, line, xp, go, sh);
+    ov.append(cv, card);
+    document.body.appendChild(ov);
+    if (!calm) ov.classList.add('flash');
+    function close(){ cancelAnimationFrame(raf); ov.remove(); }
+    go.onclick = close;
+    sh.onclick = async function(){
+      const text = 'I just conquered IMPOSSIBLE mode in ' + Number(o.tries) + ' tries 💀🔥 Can you? ' + location.origin;
+      try {
+        if (navigator.share) { await navigator.share({text: text}); }
+        else { await navigator.clipboard.writeText(text); sh.textContent = 'Copied ✅'; }
+      } catch (e) {}
+    };
+    const target = Number(o.xp) || 0, t0 = performance.now();
+    (function tick(now){
+      const p = Math.min(1, (now - t0) / 1200);
+      xp.textContent = '+' + Math.round(target * p) + ' XP';
+      if (p < 1) requestAnimationFrame(tick);
+    })(t0);
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (ctx.resume) ctx.resume();
+      [523.25, 659.25, 783.99, 1046.5, 1318.5].forEach(function(f, i){
+        const osc = ctx.createOscillator(), g = ctx.createGain();
+        osc.type = 'triangle'; osc.frequency.value = f;
+        const t = ctx.currentTime + i * 0.11;
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.12, t + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+        osc.connect(g); g.connect(ctx.destination); osc.start(t); osc.stop(t + 0.4);
+      });
+    } catch (e) {}
+    try { if (navigator.vibrate) navigator.vibrate([80, 40, 80, 40, 220]); } catch (e) {}
+    if (!calm) {
+      const c = cv.getContext('2d');
+      cv.width = window.innerWidth; cv.height = window.innerHeight;
+      const colors = ['#facc15', '#f472b6', '#60a5fa', '#34d399', '#f87171', '#ffffff'];
+      const bits = [];
+      for (let i = 0; i < 220; i++) {
+        bits.push({
+          x: Math.random() * cv.width, y: -20 - Math.random() * cv.height * 0.6,
+          w: 6 + Math.random() * 7, h: 10 + Math.random() * 8,
+          vx: -2 + Math.random() * 4, vy: 2 + Math.random() * 4,
+          r: Math.random() * 6.28, vr: -0.2 + Math.random() * 0.4,
+          c: colors[(Math.random() * colors.length) | 0]
+        });
+      }
+      const end = performance.now() + 5500;
+      (function frame(now){
+        c.clearRect(0, 0, cv.width, cv.height);
+        bits.forEach(function(b){
+          b.x += b.vx; b.y += b.vy; b.vy += 0.04; b.r += b.vr;
+          if (b.y > cv.height + 20 && now < end - 1500) { b.y = -20; b.x = Math.random() * cv.width; b.vy = 2 + Math.random() * 3; }
+          c.save(); c.translate(b.x, b.y); c.rotate(b.r); c.fillStyle = b.c;
+          c.fillRect(-b.w / 2, -b.h / 2, b.w, b.h); c.restore();
+        });
+        if (now < end) raf = requestAnimationFrame(frame);
+      })(performance.now());
+    }
+  };
+})();
+{% endraw %}
+</script>
 {% block scripts %}{% endblock %}
 </body>
 </html>
@@ -665,8 +811,15 @@ GAME = r"""{% extends "base.html" %}
   <p class="muted">🏅 Badges: {{ badges|join(', ') if badges else 'Play games to earn badges' }}</p>
   <p class="sub">I'm thinking of a number between 1 and {{ hi }}.</p>
   <div class="levels">
-    {% for name in levels %}<a href="/?level={{ name }}" class="{{ 'on' if name == level else '' }}">{{ name.title() }}</a>{% endfor %}
+    {% for name in levels %}{% set locked = name == 'impossible' and not imp_unlocked %}<a href="/?level={{ name }}" class="{{ 'on' if name == level else '' }}{{ ' imp' if name == 'impossible' else '' }}{{ ' locked' if locked else '' }}">{{ '🔒 ' if locked else ('💀 ' if name == 'impossible' else '') }}{{ name.title() }}</a>{% endfor %}
   </div>
+  {% if not imp_unlocked %}<p class="muted">🔒 Impossible mode unlocks after {{ unlock_wins }} wins ({{ wins_total }}/{{ unlock_wins }})</p>{% endif %}
+  {% if clues %}
+    <div class="box" id="clues"><b>🧠 Clues</b>
+      {% for c in clues %}<div class="clue">{{ c }}</div>{% endfor %}
+      <p class="muted" style="margin:6px 0 0">A new clue drops after every wrong guess.</p>
+    </div>
+  {% endif %}
   {% if over %}
     <a class="btn" href="/">Play again 🔁</a>
   {% else %}
@@ -685,11 +838,12 @@ GAME = r"""{% extends "base.html" %}
 {% endif %}
 {% endblock %}
 {% block scripts %}
+{% if epic %}<script>celebrate({xp: {{ epic.xp|int }}, tries: {{ epic.tries|int }}});</script>{% endif %}
 <script>
 {% raw %}
 (function(){
   const m = document.getElementById('solo-msg');
-  if (m && (m.classList.contains('win') || m.classList.contains('lose'))) {
+  if (m && !window.__epic && (m.classList.contains('win') || m.classList.contains('lose'))) {
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       const o = ctx.createOscillator(), g = ctx.createGain();
@@ -710,7 +864,7 @@ BOARD = r"""{% extends "base.html" %}
 <h1>🏆 Leaderboard</h1>
 <p class="muted">Ranked by XP · best attempts on {{ level.title() }} · updates live</p>
 <div class="levels">
-  {% for name in levels %}<a href="/leaderboard?level={{ name }}" class="{{ 'on' if name == level else '' }}">{{ name.title() }}</a>{% endfor %}
+  {% for name in levels %}<a href="/leaderboard?level={{ name }}" class="{{ 'on' if name == level else '' }}{{ ' imp' if name == 'impossible' else '' }}">{{ '💀 ' if name == 'impossible' else '' }}{{ name.title() }}</a>{% endfor %}
 </div>
 <table id="board" data-level="{{ level }}" data-me="{{ player or '' }}">
   <thead><tr><th>#</th><th>Name</th><th>XP</th><th>Best</th></tr></thead>
@@ -909,7 +1063,7 @@ CHALLENGES = r"""{% extends "base.html" %}
   <input id="opponent" name="opponent" maxlength="20" placeholder="Enter exact player name" required>
   <label for="level">Difficulty</label>
   <select id="level" name="level">
-    {% for k, (hi, tries) in levels.items() %}<option value="{{ k }}" {{ 'selected' if k == 'medium' }}>{{ k.title() }} · 1–{{ hi }} · {{ tries }} tries · {{ clocks[k] }}s</option>{% endfor %}
+    {% for k, (hi, tries) in levels.items() %}<option value="{{ k }}" {{ 'selected' if k == 'medium' }} {{ 'disabled' if k == 'impossible' and not imp_unlocked }}>{{ '💀 ' if k == 'impossible' else '' }}{{ k.title() }}{{ ' 🔒' if k == 'impossible' and not imp_unlocked else '' }} · 1–{{ hi }} · {{ tries }} tries · {{ clocks[k] }}s</option>{% endfor %}
   </select>
   <button type="submit">Send challenge →</button>
 </form>
@@ -988,6 +1142,7 @@ MATCH = r"""{% extends "base.html" %}
     <div><span class="dot" id="oppdot"></span><b id="oppname">{{ other }}</b> <span id="oppstat" class="muted"></span></div>
     <div class="muted" id="oppprog" style="margin-top:4px"></div>
   </div>
+  <div class="box" id="clueBox" hidden><b>🧠 Clues</b><div id="clues"></div></div>
   <form id="readyForm" hidden><button type="submit">I'm ready</button></form>
   <form id="guessForm" hidden>
     <input id="guess" type="number" min="1" max="{{ hi }}" placeholder="Your guess (1–{{ hi }})" required>
@@ -1066,6 +1221,18 @@ MATCH = r"""{% extends "base.html" %}
       row.append(a, b); h.appendChild(row);
     });
 
+    const cb = $('clueBox'), cl = $('clues');
+    if (d.clues && d.clues.length) {
+      cb.hidden = false; cl.replaceChildren();
+      d.clues.forEach(function(t){
+        const p = document.createElement('div'); p.className = 'clue'; p.textContent = t; cl.appendChild(p);
+      });
+    } else { cb.hidden = true; }
+    if (d.result && d.level === 'impossible' && d.result.winner === d.you) {
+      let seen = false;
+      try { seen = localStorage.getItem('epic' + cid); localStorage.setItem('epic' + cid, '1'); } catch (e) {}
+      if (!seen) celebrate({xp: d.result.xp, tries: d.me.attempts});
+    }
     const res = $('result');
     if (d.result) {
       res.hidden = false;
@@ -1233,19 +1400,28 @@ def home():
     login_error = session.pop("login_error", None)
 
     new_level = request.args.get("level")
+    lock_msg = ""
     if request.method == "GET" and new_level in LEVELS:
-        session["level"] = new_level
-        solo_reset(new_level)
+        if new_level == "impossible" and not impossible_unlocked(player):
+            lock_msg = (f"🔒 Impossible unlocks after {UNLOCK_WINS} wins. "
+                        f"You have {win_count(player)}.")
+        else:
+            session["level"] = new_level
+            solo_reset(new_level)
 
     level = session.get("level", "medium")
-    if level not in LEVELS:
+    if level not in LEVELS or (level == "impossible" and not impossible_unlocked(player)):
         level = "medium"
+        session["level"] = "medium"
     hi, max_tries = LEVELS[level]
     st = solo_get(level)
 
     message, kind, over = "", "", False
+    epic = None
     if login_error:
         message, kind = login_error, "high"
+    elif lock_msg:
+        message, kind = lock_msg, "high"
     attempts = st.attempts
 
     if request.method == "POST" and player:
@@ -1265,6 +1441,8 @@ def home():
             if guess == secret:
                 over, kind = True, "win"
                 xp_reward = max(5, 35 - (tries * 5))
+                if level == "impossible":
+                    xp_reward = xp_reward * 3 + 50
                 first_win_today = claim_once(DailyWinBonus, name=player, bonus_date=today_str())
                 daily_bonus = 20 if first_win_today else 0
                 db.session.add(Score(name=player, level=level, attempts=tries))
@@ -1277,20 +1455,23 @@ def home():
                 message = f"You got it in {tries} attempts! 🎉 Saved to the leaderboard. ⭐ +{xp_reward} XP!"
                 if daily_bonus:
                     message += f" 🎯 +{daily_bonus} daily challenge bonus!"
+                if level == "impossible":
+                    epic = {"xp": xp_reward + daily_bonus, "tries": tries}
                 bump("games_played")
                 bump("wins")
             elif tries >= max_tries:
                 over, kind = True, "lose"
                 db.session.add(Game(name=player, level=level, won=False, attempts=tries, secret=secret))
-                award_xp(player, 5)
+                play_xp = 10 if level == "impossible" else 5
+                award_xp(player, play_xp)
                 update_daily_missions(player, False, level, tries)
                 st = solo_get(level)
                 st.secret, st.attempts = random.randint(1, hi), 0
                 db.session.commit()
-                message = f"Out of attempts. It was {secret} 💀 ⭐ +5 XP for playing!"
+                message = f"Out of attempts. It was {secret} 💀 ⭐ +{play_xp} XP for playing!"
                 bump("games_played")
             else:
-                message, kind = hint_for(guess, secret)
+                message, kind = hint_for(guess, secret, level)
 
     best, total_xp, bonus_claimed, daily_status = None, 0, False, ""
     if player:
@@ -1300,12 +1481,17 @@ def home():
         claimed = DailyReward.query.filter_by(name=player, reward_date=today_str()).first() is not None
         daily_status = "claimed today ✅" if claimed else '<a href="/profile">claim it on your profile</a>'
 
+    clues = []
+    if level == "impossible" and player and not over:
+        clues = clues_shown(impossible_clues(st.secret, session.get("sid", "")), st.attempts)
     return render_template(
         "game.html", message=message, kind=kind, over=over, attempts=attempts,
         level=level, levels=list(LEVELS), hi=hi, max_tries=max_tries, player=player,
         best=best, total_xp=total_xp, player_level=get_level(total_xp),
         badges=get_badges(player) if player else [], daily_status=daily_status,
-        bonus_claimed=bonus_claimed,
+        bonus_claimed=bonus_claimed, epic=epic, clues=clues,
+        imp_unlocked=impossible_unlocked(player), unlock_wins=UNLOCK_WINS,
+        wins_total=win_count(player),
     )
 
 
@@ -1562,6 +1748,10 @@ def challenges():
                 flash("You cannot challenge yourself.", "error")
             elif level not in LEVELS:
                 flash("Choose a valid difficulty.", "error")
+            elif level == "impossible" and not impossible_unlocked(name):
+                flash(f"🔒 Win {UNLOCK_WINS} games to unlock Impossible duels.", "error")
+            elif level == "impossible" and not impossible_unlocked(target.name):
+                flash(f"{target.name} hasn't unlocked Impossible yet.", "error")
             elif Challenge.query.filter(Challenge.status == "pending",
                                         ((Challenge.creator == name) & (Challenge.opponent == target.name)) |
                                         ((Challenge.creator == target.name) & (Challenge.opponent == name))).first():
@@ -1576,7 +1766,8 @@ def challenges():
         return redirect(url_for("challenges"))
 
     return render_template("challenges.html", items=challenge_items(name), online=online_players(name),
-                           levels=LEVELS, clocks=CHALLENGE_SECONDS, invite_hours=INVITE_HOURS)
+                           levels=LEVELS, clocks=CHALLENGE_SECONDS, invite_hours=INVITE_HOURS,
+                           imp_unlocked=impossible_unlocked(name))
 
 
 @app.route("/challenges/fragment")
@@ -1616,7 +1807,7 @@ def build_match_state(ch, name):
 
     guesses = []
     for i, g in enumerate([int(x) for x in mine.guesses.split(",") if x], start=1):
-        text, _kind = hint_for(g, match.secret)
+        text, _kind = hint_for(g, match.secret, ch.level)
         guesses.append({"n": i, "guess": g, "hint": text})
 
     result, banner, bkind = None, "", "info"
@@ -1644,7 +1835,12 @@ def build_match_state(ch, name):
     msgs = (ChallengeMessage.query.filter_by(challenge_id=ch.id)
             .order_by(ChallengeMessage.id.desc()).limit(30).all())
     msgs.reverse()
+    clues = []
+    if ch.level == "impossible" and phase in ("live", "done"):
+        every = impossible_clues(match.secret, f"duel{ch.id}")
+        clues = every if phase == "done" else clues_shown(every, mine.attempts)
     return {
+        "level": ch.level, "you": name, "clues": clues,
         "phase": phase, "status": ch.status, "banner": banner, "banner_kind": bkind,
         "remaining": remaining, "limit": clock.limit_seconds,
         "me": {"ready": mine.ready, "attempts": mine.attempts, "finished": mine.finished,
@@ -1758,7 +1954,7 @@ def api_challenge_action(challenge_id):
         previous = [x for x in mine.guesses.split(",") if x]
         previous.append(str(guess))
         mine.guesses = ",".join(previous)
-        text, kind = hint_for(guess, match.secret)
+        text, kind = hint_for(guess, match.secret, ch.level)
         if guess == match.secret:
             mine.solved = True
             mine.finished = True
