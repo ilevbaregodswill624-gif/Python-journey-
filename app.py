@@ -1340,9 +1340,9 @@ def set_name():
         session.pop("player", None)
         return redirect(url_for("home"))
 
-    name = request.form.get("name", "").strip()[:20]
-    if name and not re.fullmatch(r"[A-Za-z0-9_ -]{1,20}", name):
-        session["login_error"] = "Use only letters, numbers, spaces, _ or -."
+    if not re.fullmatch(r"[A-Za-z0-9_ -]{1,20}", name):
+            session["login_error"] = "Use only letters, numbers, spaces, _ or -."
+            return redirect(url_for("home"))
         return redirect(url_for("home"))
     pin = request.form.get("pin", "").strip()
     if not name or not re.fullmatch(r"\d{4}", pin):
