@@ -1,6 +1,7 @@
 import os
 import re
 import random
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, render_template, session, redirect, url_for, jsonify, flash
@@ -325,6 +326,51 @@ def clues_shown(clues, wrong_guesses):
     return clues[:min(len(clues), IMPOSSIBLE_START_CLUES + wrong_guesses)]
 
 
+# ---- deleted accounts
+def scrub_name(text, name):
+    """Replace a player's name inside text, without touching longer names that contain it."""
+    return re.sub(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", "a deleted player", text)
+
+
+def pname(name):
+    return "a deleted player" if name and str(name).startswith("[deleted-") else name
+
+
+def erase_player(name):
+    """Delete a player and their data. Finished duels stay in the opponent's history with the name anonymized.
+    Does not commit: the caller commits so the whole delete is one transaction."""
+    tag = f"[deleted-{secrets.token_hex(3)}]"
+    chs = Challenge.query.filter((Challenge.creator == name) | (Challenge.opponent == name)).all()
+    ids = [c.id for c in chs]
+    for c in chs:
+        other = c.opponent if c.creator == name else c.creator
+        if c.status in ("pending", "accepted"):
+            c.status = "expired"
+            if not other.startswith("[deleted-"):
+                notify_player(other, c.id, "expired",
+                              "⌛ A challenge was cancelled because the other player deleted their account.")
+        if c.creator == name:
+            c.creator = tag
+        else:
+            c.opponent = tag
+    db.session.flush()
+    if ids:
+        for model in (ChallengePlayerState, ChallengeReward):
+            (model.query.filter(model.challenge_id.in_(ids), model.name == name)
+             .update({"name": tag}, synchronize_session=False))
+        others = ChallengeNotice.query.filter(ChallengeNotice.challenge_id.in_(ids),
+                                              ChallengeNotice.recipient != name).all()
+        for n in others:
+            n.text = scrub_name(n.text, name)
+    ChallengeMessage.query.filter_by(sender=name).delete(synchronize_session=False)
+    ChallengeNotice.query.filter_by(recipient=name).delete(synchronize_session=False)
+    for model in (Score, DailyReward, DailyWinBonus, DailyMission, Game):
+        model.query.filter_by(name=name).delete(synchronize_session=False)
+    for model in (PlayerXP, PlayerPresence, PlayerTheme):
+        model.query.filter_by(name=name).delete(synchronize_session=False)
+    Player.query.filter_by(name=name).delete(synchronize_session=False)
+
+
 # ---- presence & notifications
 def touch_presence(name, activity="online"):
     if not name:
@@ -625,6 +671,15 @@ BASE = r"""<!DOCTYPE html>
     .epic-line{opacity:.9;margin:0 0 8px}
     .epic-xp{font-size:44px;font-weight:bold;font-variant-numeric:tabular-nums;margin:6px 0 10px}
     @media (prefers-reduced-motion:reduce){.epic-card,.clue,#epic.flash{animation:none}}
+    .nav{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin:8px 0 12px}
+    .nav a{display:flex;flex-direction:column;align-items:center;gap:2px;padding:8px 2px;border-radius:12px;font-size:11px;text-align:center}
+    .nav a b{font-size:19px;font-weight:normal;line-height:1.1}
+    .hero{padding:12px 14px;margin:0 0 14px;border-radius:14px;background:var(--soft);border:1px solid var(--line);text-align:left}
+    .pills{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+    .pill.n{text-transform:none}
+    .menu a{display:flex;justify-content:space-between;align-items:center;padding:14px;margin:8px 0;border-radius:12px;background:rgba(255,255,255,.08);color:#fff;text-decoration:none}
+    .menu a:hover{background:rgba(255,255,255,.16)}
+    .menu a.danger{background:rgba(239,68,68,.16);color:#fecaca}
   </style>
 </head>
 <body class="theme-{{ theme }}" data-auth="{{ '1' if nav_player else '' }}" data-activity="{% block activity %}online{% endblock %}">
@@ -636,12 +691,11 @@ BASE = r"""<!DOCTYPE html>
   {% set ep = request.endpoint %}
   {% if nav_player %}
   <nav class="nav">
-    <a href="/" class="{{ 'on' if ep == 'home' }}">Play</a>
-    <a href="/missions" class="{{ 'on' if ep == 'missions' }}">Missions</a>
-    <a href="/challenges" class="{{ 'on' if ep in ('challenges', 'challenge_match') }}">Challenges</a>
-    <a href="/leaderboard" class="{{ 'on' if ep == 'leaderboard' }}">Leaderboard</a>
-    <a href="/profile" class="{{ 'on' if ep in ('profile', 'history', 'progress', 'change_pin') }}">Profile</a>
-    <a href="/settings" class="{{ 'on' if ep == 'settings' }}">Theme</a>
+    <a href="/" class="{{ 'on' if ep == 'home' }}"><b>🎯</b>Play</a>
+    <a href="/missions" class="{{ 'on' if ep == 'missions' }}"><b>📋</b>Missions</a>
+    <a href="/challenges" class="{{ 'on' if ep in ('challenges', 'challenge_match') }}"><b>⚔️</b>Duels</a>
+    <a href="/leaderboard" class="{{ 'on' if ep == 'leaderboard' }}"><b>🏆</b>Ranks</a>
+    <a href="/profile" class="{{ 'on' if ep in ('profile', 'history', 'progress', 'change_pin', 'settings', 'delete_account') }}"><b>👤</b>Me</a>
   </nav>
   {% endif %}
   {% with msgs = get_flashed_messages(with_categories=true) %}
@@ -803,12 +857,14 @@ GAME = r"""{% extends "base.html" %}
   <div class="links"><a href="/leaderboard">Leaderboard</a></div>
   <p class="muted">Create an account to save XP, badges and progress.</p>
 {% else %}
-  <p class="sub">Playing as <b>{{ player }}</b> · <a href="/name">log out</a></p>
-  <p class="sub">⭐ XP: <b>{{ total_xp }}</b> · Level <b>{{ player_level }}</b></p>
-  <div class="track"><span style="width:{{ total_xp % 100 }}%"></span></div>
-  <p class="muted">🎁 Daily login reward: {{ daily_status|safe }}</p>
-  <p class="muted">🎯 Daily challenge: {{ 'win bonus claimed today ✅' if bonus_claimed else 'win a game today for bonus XP' }}</p>
-  <p class="muted">🏅 Badges: {{ badges|join(', ') if badges else 'Play games to earn badges' }}</p>
+  <div class="hero">
+    <div class="row"><span>👤 <b>{{ player }}</b></span><span class="pill n">Lv {{ player_level }} · ⭐ {{ total_xp }} XP</span></div>
+    <div class="track"><span style="width:{{ total_xp % 100 }}%"></span></div>
+    <div class="pills">
+      <span class="pill n">🎁 Daily: {{ daily_status|safe }}</span>
+      <span class="pill n">🎯 {{ 'Win bonus claimed ✅' if bonus_claimed else 'Win bonus ready' }}</span>
+    </div>
+  </div>
   <p class="sub">I'm thinking of a number between 1 and {{ hi }}.</p>
   <div class="levels">
     {% for name in levels %}{% set locked = name == 'impossible' and not imp_unlocked %}<a href="/?level={{ name }}" class="{{ 'on' if name == level else '' }}{{ ' imp' if name == 'impossible' else '' }}{{ ' locked' if locked else '' }}">{{ '🔒 ' if locked else ('💀 ' if name == 'impossible' else '') }}{{ name.title() }}</a>{% endfor %}
@@ -831,10 +887,6 @@ GAME = r"""{% extends "base.html" %}
   <div class="msg {{ kind }}" id="solo-msg">{{ message }}</div>
   <div class="dots">{% for i in range(max_tries) %}<span class="{{ 'used' if i < attempts else '' }}"></span>{% endfor %}</div>
   {% if best %}<div class="small">🏆 Your best on {{ level }}: {{ best }}</div>{% endif %}
-  <div class="links">
-    <a href="/leaderboard?level={{ level }}">Leaderboard</a>
-    <a href="/history">My history</a>
-  </div>
 {% endif %}
 {% endblock %}
 {% block scripts %}
@@ -880,7 +932,7 @@ BOARD = r"""{% extends "base.html" %}
   </tbody>
 </table>
 <p class="sub" id="board-empty" {% if rows %}hidden{% endif %}>No players yet. Be the first 👀</p>
-<a class="btn" href="/">Back to game</a>
+
 {% endblock %}
 {% block scripts %}
 <script>
@@ -938,7 +990,7 @@ HIST = r"""{% extends "base.html" %}
 {% else %}
 <p class="sub">No games yet. Go play one 👀</p>
 {% endif %}
-<a class="btn" href="/">Back to game</a>
+
 {% endblock %}
 """
 
@@ -956,7 +1008,7 @@ MISSIONS = r"""{% extends "base.html" %}
   <p class="muted">{{ '✅ Completed' if m.completed else (m.progress ~ '/' ~ m.target ~ ' progress') }}</p>
 </section>
 {% endfor %}
-<a class="btn alt" href="/">← Back to game</a>
+
 {% endblock %}
 """
 
@@ -979,9 +1031,13 @@ PROFILE = r"""{% extends "base.html" %}
   <p style="margin:0 0 6px">🎁 Daily login reward: <b>{{ 'already claimed today' if claimed else 'ready to claim' }}</b></p>
   {% if not claimed %}<form method="post" action="/claim-daily"><button type="submit">Claim +10 XP</button></form>{% endif %}
 </div>
-<div class="links">
-  <a href="/history">History</a><a href="/progress">Progress</a><a href="/missions">Missions</a>
-  <a href="/challenges">Challenges</a><a href="/change-pin">Change PIN</a><a href="/settings">Theme</a>
+<div class="menu">
+  <a href="/history"><span>📜 History</span><span>›</span></a>
+  <a href="/progress"><span>📈 Progress</span><span>›</span></a>
+  <a href="/settings"><span>🎨 Theme</span><span>›</span></a>
+  <a href="/change-pin"><span>🔐 Change PIN</span><span>›</span></a>
+  <a href="/name"><span>🚪 Log out</span><span>›</span></a>
+  <a href="/delete-account" class="danger"><span>🗑️ Delete account</span><span>›</span></a>
 </div>
 {% endblock %}
 """
@@ -1009,7 +1065,7 @@ SETTINGS = r"""{% extends "base.html" %}
     <button type="submit" name="theme" value="{{ key }}" class="{{ '' if key == theme else 'alt' }}">{{ label }}{{ ' ✓' if key == theme }}</button>
   {% endfor %}
 </form>
-<a class="btn alt" href="/">← Back to game</a>
+
 {% endblock %}
 """
 
@@ -1032,7 +1088,7 @@ PROGRESS = r"""{% extends "base.html" %}
   {% for n, g in recent %}<div><span>Game {{ n }}</span><span>{{ '🏆 Win' if g.won else '❌ Loss' }} · {{ g.attempts }} tries · {{ g.level.title() }}</span></div>
   {% else %}<p class="muted">No games yet.</p>{% endfor %}
 </div>
-<a class="btn alt" href="/">← Back to game</a>
+
 {% endblock %}
 """
 
@@ -1110,9 +1166,9 @@ CHALLENGE_LIST = r"""<h2>🟢 Online now</h2>
 {% for it in items %}
   {% set c = it.c %}
   <section class="box">
-    <div class="row"><strong>{{ c.creator }} vs {{ c.opponent }}</strong><span class="pill">{{ c.status }}</span></div>
+    <div class="row"><strong>{{ c.creator|pn }} vs {{ c.opponent|pn }}</strong><span class="pill">{{ c.status }}</span></div>
     <p class="muted" style="margin:6px 0 2px">{{ 'Incoming' if it.incoming else 'Sent' }} · {{ it.level }} · ⏱ {{ it.limit }}s clock</p>
-    <p class="muted" style="margin:2px 0"><span class="dot {{ it.presence.state }}"></span>{{ it.other }} is {{ it.presence.state }}{% if it.presence.state == 'offline' and it.presence.last_seen %} · last seen <time data-utc="{{ it.presence.last_seen }}"></time>{% endif %}</p>
+    <p class="muted" style="margin:2px 0"><span class="dot {{ it.presence.state }}"></span>{{ it.other|pn }} is {{ it.presence.state }}{% if it.presence.state == 'offline' and it.presence.last_seen %} · last seen <time data-utc="{{ it.presence.last_seen }}"></time>{% endif %}</p>
     <p class="muted" style="margin:2px 0">Sent <time data-utc="{{ iso(c.created) }}">{{ c.created.strftime('%d %b %H:%M') if c.created else '' }}</time></p>
     {% if it.incoming and c.status == 'pending' %}
       <div class="actions">
@@ -1131,7 +1187,7 @@ MATCH = r"""{% extends "base.html" %}
 {% block activity %}in-game{% endblock %}
 {% block content %}
 <section id="match" data-cid="{{ c.id }}" data-hi="{{ hi }}" data-max="{{ max_tries }}" data-limit="{{ limit }}">
-  <h1>⚔️ {{ c.creator }} vs {{ c.opponent }}</h1>
+  <h1>⚔️ {{ c.creator|pn }} vs {{ c.opponent|pn }}</h1>
   <p class="muted">{{ c.level.title() }} · number 1–{{ hi }} · {{ max_tries }} tries · {{ limit }}s clock</p>
   <div class="clock" id="clock">--:--</div>
   <p class="muted" id="clockLabel"></p>
@@ -1139,7 +1195,7 @@ MATCH = r"""{% extends "base.html" %}
   <p class="msg" id="flash" style="font-size:16px;min-height:20px"></p>
   <div class="dots" id="dots"></div>
   <div class="box">
-    <div><span class="dot" id="oppdot"></span><b id="oppname">{{ other }}</b> <span id="oppstat" class="muted"></span></div>
+    <div><span class="dot" id="oppdot"></span><b id="oppname">{{ other|pn }}</b> <span id="oppstat" class="muted"></span></div>
     <div class="muted" id="oppprog" style="margin-top:4px"></div>
   </div>
   <div class="box" id="clueBox" hidden><b>🧠 Clues</b><div id="clues"></div></div>
@@ -1301,13 +1357,38 @@ MATCH = r"""{% extends "base.html" %}
 {% endblock %}
 """
 
+DELETE_ACCOUNT = r"""{% extends "base.html" %}
+{% block title %}Delete account{% endblock %}
+{% block cardclass %}left{% endblock %}
+{% block content %}
+<h1>🗑️ Delete account</h1>
+<p class="sub">This is permanent. Here's what happens:</p>
+<div class="box">
+  <p style="margin:0 0 6px">❌ Your name, PIN, XP, badges, history, scores and missions are erased.</p>
+  <p style="margin:0 0 6px">❌ You disappear from the leaderboard.</p>
+  <p style="margin:0 0 6px">❌ Your chat messages are deleted and open challenges are cancelled.</p>
+  <p style="margin:0">ℹ️ Finished duels stay in your opponent's history, with your name replaced by "a deleted player".</p>
+</div>
+<form method="post">
+  <label for="pin">Enter your PIN</label>
+  <input id="pin" name="pin" type="password" inputmode="numeric" maxlength="4" placeholder="Your PIN" required>
+  <label for="confirm">Type DELETE to confirm</label>
+  <input id="confirm" name="confirm" autocomplete="off" placeholder="DELETE" required>
+  <button class="danger" type="submit">Delete my account forever</button>
+</form>
+<a class="btn alt" href="/profile">Cancel</a>
+{% endblock %}
+"""
+
 app.jinja_loader = DictLoader({
     "base.html": BASE, "game.html": GAME, "board.html": BOARD, "history.html": HIST,
     "missions.html": MISSIONS, "profile.html": PROFILE, "change_pin.html": CHANGE_PIN,
     "settings.html": SETTINGS, "progress.html": PROGRESS, "notifications.html": NOTIFS,
     "challenges.html": CHALLENGES, "challenge_list.html": CHALLENGE_LIST, "match.html": MATCH,
+    "delete_account.html": DELETE_ACCOUNT,
 })
 app.jinja_env.globals["iso"] = iso
+app.jinja_env.filters["pn"] = pname
 
 
 @app.context_processor
@@ -1334,6 +1415,14 @@ def no_store_for_api(resp):
 
 
 # ---------------------------------------------------------------- auth
+@app.before_request
+def drop_deleted_player():
+    """If this browser is still logged in as a deleted account, log it out instead of recreating data."""
+    name = session.get("player")
+    if name and db.session.query(Player.id).filter_by(name=name).first() is None:
+        session.pop("player", None)
+
+
 @app.route("/name", methods=["GET", "POST"])
 def set_name():
     if request.method == "GET":
@@ -1695,7 +1784,7 @@ def challenge_items(name):
         result = ""
         if c.status == "completed":
             w = c.creator if c.creator_won else c.opponent if c.opponent_won else None
-            result = "🤝 Draw" if w is None else ("🏆 You won" if w == name else f"💀 {w} won")
+            result = "🤝 Draw" if w is None else ("🏆 You won" if w == name else f"💀 {pname(w)} won")
         items.append({"c": c, "incoming": c.opponent == name, "other": other, "presence": presence_of(other),
                       "result": result, "level": c.level.title(), "limit": CHALLENGE_SECONDS[c.level]})
     return items
@@ -1814,7 +1903,7 @@ def build_match_state(ch, name):
     if phase == "done":
         winner = ch.creator if ch.creator_won else ch.opponent if ch.opponent_won else None
         reward = ChallengeReward.query.filter_by(challenge_id=ch.id, name=name).first()
-        text = "🤝 Draw!" if winner is None else (f"🏆 {winner} wins!")
+        text = "🤝 Draw!" if winner is None else (f"🏆 {pname(winner)} wins!")
         result = {"text": text, "secret": match.secret, "winner": winner, "xp": reward.amount if reward else 0}
         banner = text
         bkind = "win" if winner == name else ("lose" if winner else "info")
@@ -1993,6 +2082,48 @@ def api_pulse():
         "id": n.id, "text": n.text, "kind": n.kind, "created": iso(n.created),
         "url": f"/challenge/{n.challenge_id}" if n.kind in ("started", "completed") else "/challenges",
     } for n in unseen])
+
+
+@app.route("/delete-account", methods=["GET", "POST"])
+def delete_account():
+    name = session.get("player")
+    if not name:
+        return redirect(url_for("home"))
+    if request.method == "POST":
+        player = Player.query.filter_by(name=name).first()
+        now = utcnow()
+        pin = request.form.get("pin", "")
+        if not player:
+            session.pop("player", None)
+            return redirect(url_for("home"))
+        if player.locked_until and player.locked_until > now:
+            flash("Too many wrong tries. Wait a few minutes.", "error")
+        elif not check_password_hash(player.pin_hash, pin):
+            player.fails += 1
+            if player.fails >= MAX_FAILS:
+                player.fails = 0
+                player.locked_until = now + timedelta(minutes=LOCK_MINUTES)
+            db.session.commit()
+            flash("Wrong PIN.", "error")
+        elif request.form.get("confirm", "").strip().upper() != "DELETE":
+            flash("Type DELETE to confirm.", "error")
+        else:
+            try:
+                sid = session.get("sid")
+                erase_player(name)
+                if sid:
+                    SoloState.query.filter_by(sid=sid).delete(synchronize_session=False)
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                flash("Something went wrong and nothing was deleted. Try again.", "error")
+                return redirect(url_for("delete_account"))
+            session.pop("player", None)
+            session.pop("theme", None)
+            flash("Your account was deleted. 👋", "success")
+            return redirect(url_for("home"))
+        return redirect(url_for("delete_account"))
+    return render_template("delete_account.html")
 
 
 # ---------------------------------------------------------------- admin
