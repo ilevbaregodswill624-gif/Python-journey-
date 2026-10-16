@@ -38,8 +38,27 @@ READY_MINUTES = 60       # accepted matches expire if nobody starts in this wind
 ONLINE_SECONDS = 25      # seen within this window = online
 WIN_XP, LOSS_XP, DRAW_XP = 50, 10, 20
 
-THEMES = {"purple": "Purple", "ocean": "Ocean", "sunset": "Sunset",
-          "dark": "Dark", "forest": "Forest"}
+THEMES = {
+    "purple": "Purple", "ocean": "Ocean", "sunset": "Sunset", "dark": "Dark", "forest": "Forest",  # free
+    "sakura": "Sakura", "slate": "Slate", "ice": "Ice", "candy": "Candy",                           # unlockable
+    "lava": "Lava", "galaxy": "Galaxy", "matrix": "Matrix", "gold": "Gold",
+}
+THEME_EMOJI = {
+    "purple": "🟣", "ocean": "🌊", "sunset": "🌇", "dark": "🌑", "forest": "🌲",
+    "sakura": "🌸", "slate": "🩶", "ice": "🧊", "candy": "🍬",
+    "lava": "🔥", "galaxy": "🌌", "matrix": "🟢", "gold": "👑",
+}
+# key: (stat, target, how to earn it). Themes not listed here are free.
+THEME_UNLOCKS = {
+    "sakura": ("level", 3, "Reach Level 3"),
+    "slate": ("played", 25, "Play 25 games"),
+    "ice": ("wins", 10, "Win 10 games"),
+    "candy": ("duel_wins", 3, "Win 3 duels"),
+    "lava": ("hard_wins", 3, "Win 3 Hard games"),
+    "galaxy": ("level", 10, "Reach Level 10"),
+    "matrix": ("imp_wins", 1, "Win 1 Impossible game"),
+    "gold": ("imp_wins", 5, "Win 5 Impossible games"),
+}
 
 
 # ---------------------------------------------------------------- models
@@ -326,6 +345,47 @@ def clues_shown(clues, wrong_guesses):
     return clues[:min(len(clues), IMPOSSIBLE_START_CLUES + wrong_guesses)]
 
 
+# ---- theme unlocks
+def player_stats(name):
+    games = Game.query.filter_by(name=name).all()
+    xp = get_xp(name)
+    duel_wins = Challenge.query.filter(
+        Challenge.status == "completed",
+        ((Challenge.creator == name) & (Challenge.creator_won.is_(True))) |
+        ((Challenge.opponent == name) & (Challenge.opponent_won.is_(True)))).count()
+    return {
+        "xp": xp, "level": get_level(xp), "played": len(games),
+        "wins": sum(1 for g in games if g.won),
+        "hard_wins": sum(1 for g in games if g.won and g.level == "hard"),
+        "imp_wins": sum(1 for g in games if g.won and g.level == "impossible"),
+        "duel_wins": duel_wins,
+    }
+
+
+def theme_unlocked(key, stats):
+    need = THEME_UNLOCKS.get(key)
+    return need is None or stats[need[0]] >= need[1]
+
+
+def check_theme_unlocks(name):
+    """Send a one-time notification for every theme this player has just earned."""
+    stats = player_stats(name)
+    for key, (stat, target, _desc) in THEME_UNLOCKS.items():
+        if stats[stat] < target:
+            continue
+        text = f"🎨 Theme unlocked: {THEME_EMOJI[key]} {THEMES[key]}! Equip it in Me → Theme."
+        if not ChallengeNotice.query.filter_by(recipient=name, kind="theme", text=text).first():
+            notify_player(name, 0, "theme", text)
+
+
+def notice_url(n):
+    if n.kind in ("started", "completed"):
+        return f"/challenge/{n.challenge_id}"
+    if n.kind == "theme":
+        return "/settings"
+    return "/challenges"
+
+
 # ---- deleted accounts
 def scrub_name(text, name):
     """Replace a player's name inside text, without touching longer names that contain it."""
@@ -533,6 +593,7 @@ def finalize_if_done(ch, states, match):
         else:
             text = f"💀 {winner} won your {ch.level.title()} duel. +{amount} XP for playing"
         notify_player(s.name, ch.id, "completed", text)
+        check_theme_unlocks(s.name)
     try:
         db.session.commit()
     except IntegrityError:
@@ -579,11 +640,11 @@ BASE = r"""<!DOCTYPE html>
   <style>
     *{box-sizing:border-box}
     [hidden]{display:none!important}
-    :root,body.theme-purple{--bg:linear-gradient(135deg,#1e1b4b,#4c1d95,#be185d);--accent:#facc15;--accent-ink:#1e1b4b}
-    body.theme-ocean{--bg:linear-gradient(135deg,#082f49,#0369a1,#0f766e);--accent:#fde047;--accent-ink:#082f49}
-    body.theme-sunset{--bg:linear-gradient(135deg,#7c2d12,#c2410c,#9d174d);--accent:#fde68a;--accent-ink:#431407}
-    body.theme-dark{--bg:linear-gradient(135deg,#09090b,#27272a,#18181b);--accent:#a78bfa;--accent-ink:#0b0b10}
-    body.theme-forest{--bg:linear-gradient(135deg,#052e16,#166534,#3f6212);--accent:#bef264;--accent-ink:#052e16}
+    :root,.theme-purple{--bg:linear-gradient(135deg,#1e1b4b,#4c1d95,#be185d);--accent:#facc15;--accent-ink:#1e1b4b}
+    .theme-ocean{--bg:linear-gradient(135deg,#082f49,#0369a1,#0f766e);--accent:#fde047;--accent-ink:#082f49}
+    .theme-sunset{--bg:linear-gradient(135deg,#7c2d12,#c2410c,#9d174d);--accent:#fde68a;--accent-ink:#431407}
+    .theme-dark{--bg:linear-gradient(135deg,#09090b,#27272a,#18181b);--accent:#a78bfa;--accent-ink:#0b0b10}
+    .theme-forest{--bg:linear-gradient(135deg,#052e16,#166534,#3f6212);--accent:#bef264;--accent-ink:#052e16}
     body{--panel:rgba(255,255,255,.10);--line:rgba(255,255,255,.20);--soft:rgba(0,0,0,.18);
       --good:#86efac;--bad:#fca5a5;--info:#93c5fd;
       margin:0;min-height:100vh;color:#fff;background:var(--bg) fixed;
@@ -680,6 +741,22 @@ BASE = r"""<!DOCTYPE html>
     .menu a{display:flex;justify-content:space-between;align-items:center;padding:14px;margin:8px 0;border-radius:12px;background:rgba(255,255,255,.08);color:#fff;text-decoration:none}
     .menu a:hover{background:rgba(255,255,255,.16)}
     .menu a.danger{background:rgba(239,68,68,.16);color:#fecaca}
+    .theme-sakura{--bg:linear-gradient(135deg,#4a0d2e,#9d174d,#be185d);--accent:#fce7f3;--accent-ink:#500724}
+    .theme-slate{--bg:linear-gradient(135deg,#0f172a,#1e293b,#334155);--accent:#93c5fd;--accent-ink:#0b1220}
+    .theme-ice{--bg:linear-gradient(135deg,#0c1e3a,#1e3a8a,#155e75);--accent:#a5f3fc;--accent-ink:#082f49}
+    .theme-candy{--bg:linear-gradient(135deg,#831843,#be185d,#115e59);--accent:#99f6e4;--accent-ink:#042f2e}
+    .theme-lava{--bg:linear-gradient(135deg,#0a0a0a,#450a0a,#9a3412);--accent:#fed7aa;--accent-ink:#1c0a00}
+    .theme-galaxy{--bg:linear-gradient(135deg,#020617,#1e1b4b,#581c87);--accent:#22d3ee;--accent-ink:#020617}
+    .theme-matrix{--bg:linear-gradient(135deg,#000000,#022c22,#064e3b);--accent:#4ade80;--accent-ink:#022c22;font-family:"Courier New",monospace}
+    .theme-gold{--bg:linear-gradient(135deg,#0a0a0a,#2b1d0a,#78350f);--accent:#fbbf24;--accent-ink:#1c1204}
+    .themes{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;text-align:left}
+    .tcard{margin:0;padding:10px;border-radius:14px;background:var(--soft);border:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
+    .tcard.on{border-color:var(--accent)}
+    .tcard .swatch{height:54px;border-radius:10px;background:var(--bg);border-bottom:4px solid var(--accent)}
+    .tcard.locked .swatch{filter:grayscale(.65) brightness(.7)}
+    .tname{font-weight:bold;font-size:14px}
+    .tcard button{margin:0;padding:9px;font-size:14px}
+    .tcard .track{margin:2px 0}
   </style>
 </head>
 <body class="theme-{{ theme }}" data-auth="{{ '1' if nav_player else '' }}" data-activity="{% block activity %}online{% endblock %}">
@@ -1056,16 +1133,25 @@ CHANGE_PIN = r"""{% extends "base.html" %}
 """
 
 SETTINGS = r"""{% extends "base.html" %}
-{% block title %}Theme{% endblock %}
+{% block title %}Themes{% endblock %}
 {% block content %}
-<h1>🎨 Choose a theme</h1>
-<p class="sub">Saved to your account, so it follows you on every page and device.</p>
-<form method="post">
-  {% for key, label in themes.items() %}
-    <button type="submit" name="theme" value="{{ key }}" class="{{ '' if key == theme else 'alt' }}">{{ label }}{{ ' ✓' if key == theme }}</button>
+<h1>🎨 Themes</h1>
+<p class="sub">Unlocked <b>{{ got }}/{{ total }}</b>. Play to earn the rest. Your pick follows you on every device.</p>
+<div class="themes">
+  {% for t in cards %}
+  <form method="post" class="tcard {{ 'on' if t.key == theme }} {{ 'locked' if not t.unlocked }}">
+    <div class="swatch theme-{{ t.key }}"></div>
+    <div class="tname">{{ t.emoji }} {{ t.label }}</div>
+    {% if t.unlocked %}
+      <button type="submit" name="theme" value="{{ t.key }}" class="{{ '' if t.key == theme else 'alt' }}">{{ '✓ Equipped' if t.key == theme else 'Use' }}</button>
+    {% else %}
+      <div class="muted">🔒 {{ t.need }}</div>
+      <div class="track"><span style="width:{{ t.pct }}%"></span></div>
+      <div class="muted">{{ t.have }}/{{ t.target }}</div>
+    {% endif %}
+  </form>
   {% endfor %}
-</form>
-
+</div>
 {% endblock %}
 """
 
@@ -1430,6 +1516,9 @@ def set_name():
         return redirect(url_for("home"))
 
     name = request.form.get("name", "").strip()[:20]
+    if name and not re.fullmatch(r"[A-Za-z0-9_ -]{1,20}", name):
+        session["login_error"] = "Use only letters, numbers, spaces, _ or -."
+        return redirect(url_for("home"))
     pin = request.form.get("pin", "").strip()
     if not name or not re.fullmatch(r"\d{4}", pin):
         session["login_error"] = "Enter a name and a 4-digit PIN."
@@ -1437,14 +1526,11 @@ def set_name():
 
     player = Player.query.filter(func.lower(Player.name) == name.lower()).first()
     if player is None:
-        if not re.fullmatch(r"[A-Za-z0-9_ -]{1,20}", name):
-            session["login_error"] = "Use only letters, numbers, spaces, _ or -."
-            return redirect(url_for("home"))
         player = Player(name=name, pin_hash=generate_password_hash(pin))
         db.session.add(player)
         db.session.add(PlayerXP(name=name, xp=0))
-        db.session.add(PlayerTheme(name=name, theme=session.get("theme", "purple")
-                                   if session.get("theme") in THEMES else "purple"))
+        db.session.add(PlayerTheme(name=name, theme=(session.get("theme") if session.get("theme") in THEMES and session.get("theme") not in THEME_UNLOCKS
+                                   else "purple")))
         try:
             db.session.commit()
         except IntegrityError:
@@ -1475,7 +1561,8 @@ def set_name():
     if th and th.theme in THEMES:
         session["theme"] = th.theme
     return redirect(url_for("home"))
-    
+
+
 # ---------------------------------------------------------------- solo game
 @app.route("/", methods=["GET", "POST"])
 def home():
@@ -1537,6 +1624,7 @@ def home():
                 db.session.add(Game(name=player, level=level, won=True, attempts=tries, secret=secret))
                 award_xp(player, xp_reward + daily_bonus)
                 update_daily_missions(player, True, level, tries)
+                check_theme_unlocks(player)
                 st = solo_get(level)
                 st.secret, st.attempts = random.randint(1, hi), 0
                 db.session.commit()
@@ -1553,6 +1641,7 @@ def home():
                 play_xp = 10 if level == "impossible" else 5
                 award_xp(player, play_xp)
                 update_daily_missions(player, False, level, tries)
+                check_theme_unlocks(player)
                 st = solo_get(level)
                 st.secret, st.attempts = random.randint(1, hi), 0
                 db.session.commit()
@@ -1720,9 +1809,14 @@ def settings():
     name = session.get("player")
     if not name:
         return redirect(url_for("home"))
+    stats = player_stats(name)
     if request.method == "POST":
         theme = request.form.get("theme", "purple")
-        if theme in THEMES:
+        if theme not in THEMES:
+            flash("Unknown theme.", "error")
+        elif not theme_unlocked(theme, stats):
+            flash(f"🔒 {THEMES[theme]} is locked: {THEME_UNLOCKS[theme][2]}.", "error")
+        else:
             session["theme"] = theme
             row = db.session.get(PlayerTheme, name)
             if row is None:
@@ -1732,7 +1826,17 @@ def settings():
             db.session.commit()
             flash(f"Theme set to {THEMES[theme]}.", "success")
         return redirect(url_for("settings"))
-    return render_template("settings.html")
+    cards = []
+    for key, label in THEMES.items():
+        need = THEME_UNLOCKS.get(key)
+        have = min(stats[need[0]], need[1]) if need else 0
+        cards.append({"key": key, "label": label, "emoji": THEME_EMOJI[key],
+                      "unlocked": theme_unlocked(key, stats),
+                      "need": need[2] if need else "", "have": have,
+                      "target": need[1] if need else 0,
+                      "pct": int(have * 100 / need[1]) if need else 100})
+    return render_template("settings.html", cards=cards,
+                           got=sum(1 for c in cards if c["unlocked"]), total=len(cards))
 
 
 @app.route("/progress")
@@ -1757,7 +1861,7 @@ def notifications():
         return redirect(url_for("home"))
     rows = ChallengeNotice.query.filter_by(recipient=name).order_by(ChallengeNotice.id.desc()).limit(50).all()
     items = [{"text": n.text, "created": n.created, "seen": n.seen,
-              "url": f"/challenge/{n.challenge_id}" if n.kind in ("started", "completed") else "/challenges"}
+              "url": notice_url(n)}
              for n in rows]
     ChallengeNotice.query.filter_by(recipient=name, seen=False).update({"seen": True}, synchronize_session=False)
     db.session.commit()
@@ -2079,7 +2183,7 @@ def api_pulse():
     unseen = q.order_by(ChallengeNotice.id.desc()).limit(10).all()
     return jsonify(unread=q.count(), notices=[{
         "id": n.id, "text": n.text, "kind": n.kind, "created": iso(n.created),
-        "url": f"/challenge/{n.challenge_id}" if n.kind in ("started", "completed") else "/challenges",
+        "url": notice_url(n),
     } for n in unseen])
 
 
