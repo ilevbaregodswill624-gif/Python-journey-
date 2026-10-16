@@ -1430,9 +1430,6 @@ def set_name():
         return redirect(url_for("home"))
 
     name = request.form.get("name", "").strip()[:20]
-    if name and not re.fullmatch(r"[A-Za-z0-9_ -]{1,20}", name):
-        session["login_error"] = "Use only letters, numbers, spaces, _ or -."
-        return redirect(url_for("home"))
     pin = request.form.get("pin", "").strip()
     if not name or not re.fullmatch(r"\d{4}", pin):
         session["login_error"] = "Enter a name and a 4-digit PIN."
@@ -1440,6 +1437,9 @@ def set_name():
 
     player = Player.query.filter(func.lower(Player.name) == name.lower()).first()
     if player is None:
+        if not re.fullmatch(r"[A-Za-z0-9_ -]{1,20}", name):
+            session["login_error"] = "Use only letters, numbers, spaces, _ or -."
+            return redirect(url_for("home"))
         player = Player(name=name, pin_hash=generate_password_hash(pin))
         db.session.add(player)
         db.session.add(PlayerXP(name=name, xp=0))
@@ -1475,8 +1475,7 @@ def set_name():
     if th and th.theme in THEMES:
         session["theme"] = th.theme
     return redirect(url_for("home"))
-
-
+    
 # ---------------------------------------------------------------- solo game
 @app.route("/", methods=["GET", "POST"])
 def home():
