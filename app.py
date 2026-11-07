@@ -23,6 +23,8 @@ if db_url.startswith("postgres://"):
 elif db_url.startswith("postgresql://"):
     db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+# Neon suspends idle databases and drops connections, so test each connection before using it.
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True, "pool_recycle": 280}
 db = SQLAlchemy(app)
 
 # ---------------------------------------------------------------- config
@@ -2240,6 +2242,24 @@ def stats():
             f"Games finished: {counts.get('games_played', 0)}<br>"
             f"Wins: {counts.get('wins', 0)}<br>"
             f"Registered players: {Player.query.count()}")
+
+
+@app.route("/admin/backup")
+def admin_backup():
+    """Download every table as JSON. Open /admin/backup?key=YOUR_ADMIN_KEY and save the file.
+    Contains PIN hashes, so keep the file private."""
+    key = os.environ.get("ADMIN_KEY")
+    if not key or not secrets.compare_digest(request.args.get("key", ""), key):
+        return "Not found", 404
+    data = {}
+    for table in db.metadata.sorted_tables:
+        rows = db.session.execute(table.select()).mappings().all()
+        data[table.name] = [{k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in r.items()}
+                            for r in rows]
+    stamp = utcnow().strftime("%Y%m%d-%H%M")
+    resp = jsonify(data)
+    resp.headers["Content-Disposition"] = f"attachment; filename=guessing-game-backup-{stamp}.json"
+    return resp
 
 
 if __name__ == "__main__":
